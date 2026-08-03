@@ -3,5 +3,6 @@
 # Only https://www.emag.ro/.../c and https://emag.ro/.../c paths are valid.
 
 
-https://www.emag.ro/boxe/c?ref=bc
 
+
+https://www.emag.ro/produse-cosmetice-gravide/c?ref=search_menu_category

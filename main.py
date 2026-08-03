@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-eMAG 商品列表爬虫 V2.0.3
+eMAG 商品列表爬虫 V2.1.0
 基于 Scrapling 纯 HTTP Fetcher, 支持多类目并发抓取
 
 使用方法:
@@ -29,7 +29,7 @@ from utils import (
 def parse_args() -> argparse.Namespace:
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
-        description="eMAG 商品列表爬虫 V2.0.3 — 纯 HTTP 模式",
+        description="eMAG 商品列表爬虫 V2.1.0 — 纯 HTTP 模式",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default=None, help="输出目录 (默认: output/YYYYMMDD_HHMMSS)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                       help="日志级别 (默认: INFO)")
-    parser.add_argument("--version", action="version", version="eMAG Crawler V2.0.3")
+    parser.add_argument("--version", action="version", version="eMAG Crawler V2.1.0")
 
     return parser.parse_args()
 
@@ -77,7 +77,7 @@ def print_startup_info(categories: list[dict], max_pages: int | None,
                        download_images: bool, args: argparse.Namespace, output_dir: str):
     """打印启动信息"""
     print("=" * 60)
-    print("  eMAG 商品列表爬虫 V2.0.3 (纯 HTTP)")
+    print("  eMAG 商品列表爬虫 V2.1.0 (纯 HTTP)")
     print("=" * 60)
     print(f"  已启用类目数量: {len(categories)}")
     for cat in categories:

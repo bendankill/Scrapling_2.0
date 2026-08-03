@@ -1,5 +1,5 @@
 """
-爬虫核心 V2.0.3: 纯HTTP, 真正Session复用, 按页码顺序提交, --all-pages=20
+爬虫核心 V2.1.0: 纯HTTP, 真正Session复用, 按页码顺序提交, --all-pages=20
 """
 import hashlib
 import json
@@ -563,7 +563,7 @@ class EmagCrawler:
         self.exporters.finalize()
 
         summary = {
-            "version": "2.0.3",
+            "version": "2.1.0",
             "status": "waf_blocked" if waf_detected else "completed",
             "start_time": datetime.fromtimestamp(self.start_time, tz=timezone.utc).isoformat(),
             "end_time": datetime.now(timezone.utc).isoformat(),
