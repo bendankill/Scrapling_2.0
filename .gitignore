@@ -1,0 +1,42 @@
+# Python 虚拟环境
+.venv/
+venv/
+env/
+
+# 输出目录
+output/
+
+# 缓存
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+
+# 日志
+*.log
+logs/
+
+# 临时文件
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# 图片下载
+images/
+
+# IDE
+.idea/
+.vscode/
+*.sublime-*
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+
+# 上游依赖临时目录
+.scrapling_inspect/
