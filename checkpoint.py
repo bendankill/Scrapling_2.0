@@ -100,14 +100,27 @@ class CheckpointManager:
             for c in self.data["categories"]:
                 if c["url"] == cat_url: c.update(kw); self._ts(); break
 
-    # ---- 原子产品键操作 ----
+    # ---- 原子产品键操作 (S1-3: 持久化到 completed_product_keys) ----
     def check_and_add_product_keys(self, keys: list) -> tuple:
-        """原子操作: 检查并添加产品键。返回 (new_keys, dup_count)"""
+        """原子操作: 检查并添加产品键。返回 (new_unique_keys_list, dup_count)。
+        S1-2修复: new_keys只包含首次出现的键, dup_count=总输入-新键数。
+        S1-3修复: 同步持久化到 data['completed_product_keys']。
+        """
         new, dup = [], 0
         with self._keys_lock:
             for k in keys:
-                if k in self._product_keys: dup += 1
-                else: self._product_keys.add(k); new.append(k)
+                if k in self._product_keys:
+                    dup += 1
+                else:
+                    self._product_keys.add(k)
+                    new.append(k)
+            # S1-3: 持久化
+            if new:
+                existing = set(self.data.get("completed_product_keys", []))
+                for k in new:
+                    if k not in existing:
+                        existing.add(k)
+                self.data["completed_product_keys"] = sorted(existing)
         return new, dup
 
     def has_product_key(self, k):
@@ -115,10 +128,24 @@ class CheckpointManager:
 
     def add_product_keys(self, keys):
         with self._keys_lock:
-            for k in keys: self._product_keys.add(k)
+            new_added = []
+            for k in keys:
+                if k not in self._product_keys:
+                    self._product_keys.add(k)
+                    new_added.append(k)
+            if new_added:
+                existing = set(self.data.get("completed_product_keys", []))
+                for k in new_added:
+                    existing.add(k)
+                self.data["completed_product_keys"] = sorted(existing)
 
     def get_product_key_count(self):
         with self._keys_lock: return len(self._product_keys)
+
+    def sync_product_keys_to_checkpoint(self):
+        """确保 checkpoint 中的 completed_product_keys 与内存一致"""
+        with self._keys_lock:
+            self.data["completed_product_keys"] = sorted(self._product_keys)
 
     # ---- 页面快照 ----
     def save_page_snapshot(self, cat_url, page_num, products):

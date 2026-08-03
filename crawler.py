@@ -297,18 +297,25 @@ class EmagCrawler:
         if all_prods:
             self.cp.save_page_snapshot(base_url, pr.page_number, all_prods)
 
-        # S0-6: 去重在锁内原子完成
+        # S1-2修复: 去重在锁内原子完成, new_unique=len(added_keys), dup=total-added
         new_products, dup_count = [], 0
         new_keys = []
         if all_prods:
             all_keys = [get_product_key(p.to_dict()) for p in all_prods]
             added_keys, dup_count = self.cp.check_and_add_product_keys(all_keys)
-            # 用 added_keys 筛选新增商品
-            added_set = set(added_keys)
-            new_products = [p for p in all_prods if get_product_key(p.to_dict()) in added_set]
+            # S1-2: new_unique_products = len(added_keys) (首次出现的键数)
+            # duplicates = 总键数 - 新键数
             new_keys = added_keys
+            # 按出现顺序保留首次新增的商品
+            added_set = set(added_keys)
+            seen_new = set()
+            for p in all_prods:
+                k = get_product_key(p.to_dict())
+                if k in added_set and k not in seen_new:
+                    new_products.append(p)
+                    seen_new.add(k)
 
-        pr.new_unique_products = len(new_products)
+        pr.new_unique_products = len(added_keys) if all_prods else 0
         pr.duplicates = dup_count
         pr.products = new_products
         pr.product_keys = new_keys
@@ -323,12 +330,12 @@ class EmagCrawler:
         stats.products_parsed += pr.products_parsed
         stats.parse_failed += pr.parse_failed
         stats.duplicates += dup_count
-        stats.new_unique += len(new_products)
+        stats.new_unique += (len(added_keys) if all_prods else 0)
 
         self.cp.mark_page_completed(base_url, pr.page_number,
             cards_found=pr.cards_found, products_parsed=pr.products_parsed,
             parse_failed=pr.parse_failed, duplicates=dup_count,
-            new_unique=len(new_products))
+            new_unique=(len(added_keys) if all_prods else 0))
 
         logger.info(f"[{name}] P{pr.page_number}: cards={pr.cards_found} "
                     f"parsed={pr.products_parsed} fail={pr.parse_failed} "
