@@ -1,103 +1,65 @@
 """
-爬虫核心 V2.1.1: checkpoint断点续抓, PageResult统计, Ctrl+C安全中断
+爬虫核心 V2.1.1-fix: 统一RunStatus, 顺序提交, 全部卡片保留, 并发去重修复
 """
-import hashlib
-import json
-import logging
-import os
-import signal
-import time
-import threading
+import hashlib, json, logging, os, signal, time, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Lock, Semaphore, Event
 from typing import Optional
-from urllib.parse import urljoin
 
 from scrapling.fetchers import FetcherSession
-
 from models import ProductItem
 from parser import parse_product_listing, extract_next_page, extract_total_pages, page_has_products
 from image_downloader import ImageDownloader
 from exporters import Exporters
-from checkpoint import CheckpointManager
-from utils import (
-    detect_waf_block, WafBlockError, get_product_key,
-    write_errors_csv, write_atomic_json, ensure_errors_csv,
-    EXIT_CAPTCHA, EXIT_NETWORK_ERROR, EXIT_SUCCESS, EXIT_INTERRUPT, EXIT_CONFIG_ERROR,
-)
+from checkpoint import CheckpointManager, RunStatus
+from utils import (detect_waf_block, WafBlockError, get_product_key,
+    write_errors_csv, write_atomic_json, ensure_errors_csv)
 
 logger = logging.getLogger("emag_crawler.crawler")
-
 ALL_PAGES_LIMIT = 20
 
 
 @dataclass
 class PageResult:
-    """单页抓取结果"""
-    page_number: int = 0
-    page_url: str = ""
-    http_status: int = 0
-    cards_found: int = 0
-    products_parsed: int = 0
-    parse_failed: int = 0
-    duplicates: int = 0
-    new_unique_products: int = 0
-    next_url: str = ""
-    has_next: bool = False
-    is_last_page: bool = False
+    page_number: int = 0; page_url: str = ""; http_status: int = 0
+    cards_found: int = 0; products_parsed: int = 0; parse_failed: int = 0
+    duplicates: int = 0; new_unique_products: int = 0
+    next_url: str = ""; has_next: bool = False; is_last_page: bool = False
     products: list = field(default_factory=list)
+    all_products: list = field(default_factory=list)  # 全部卡片(含重复)
     product_keys: list = field(default_factory=list)
     parse_errors: list = field(default_factory=list)
-    html_hash: str = ""
-    waf_error: Optional[WafBlockError] = None
-    total_pages: Optional[int] = None
+    html_hash: str = ""; waf_error = None; total_pages: Optional[int] = None
 
 
 class CategoryStats:
-    def __init__(self, name: str, url: str):
+    def __init__(self, name, url):
         self.name = name; self.url = url
         self.requested_pages = 0; self.success_pages = 0; self.failed_pages = 0
         self.total_records = 0; self.unique_products = 0
         self.image_success = 0; self.image_failed = 0
         self.start_time = time.time(); self.end_time = 0.0
         self.cards_found = 0; self.products_parsed = 0; self.parse_failed = 0
-        self.duplicates = 0; self.new_unique = 0
-        self.stop_reason = ""
-
+        self.duplicates = 0; self.new_unique = 0; self.stop_reason = ""
     @property
-    def elapsed(self) -> float:
-        return self.end_time - self.start_time if self.end_time else 0
-
-    def to_dict(self) -> dict:
-        return {
-            "name": self.name, "url": self.url,
-            "requested_pages": self.requested_pages,
-            "success_pages": self.success_pages,
-            "failed_pages": self.failed_pages,
-            "total_records": self.total_records,
-            "unique_products": self.unique_products,
-            "image_success": self.image_success,
-            "image_failed": self.image_failed,
-            "elapsed_seconds": round(self.elapsed, 2),
-            "stop_reason": self.stop_reason,
-            "cards_found": self.cards_found,
-            "products_parsed": self.products_parsed,
-            "parse_failed": self.parse_failed,
-            "duplicates": self.duplicates,
-            "new_unique": self.new_unique,
-        }
+    def elapsed(self): return self.end_time - self.start_time if self.end_time else 0
+    def to_dict(self):
+        return {"name": self.name, "url": self.url,
+            "requested_pages": self.requested_pages, "success_pages": self.success_pages,
+            "failed_pages": self.failed_pages, "total_records": self.total_records,
+            "unique_products": self.unique_products, "image_success": self.image_success,
+            "image_failed": self.image_failed, "elapsed_seconds": round(self.elapsed, 2),
+            "stop_reason": self.stop_reason, "cards_found": self.cards_found,
+            "products_parsed": self.products_parsed, "parse_failed": self.parse_failed,
+            "duplicates": self.duplicates, "new_unique": self.new_unique}
 
 
 class EmagCrawler:
-    """eMAG 爬虫 V2.1.1"""
-
-    def __init__(self, output_dir: str, image_downloader=None,
-                 page_workers=3, category_workers=2, max_in_flight=8,
-                 download_images=True, log_level="INFO", all_pages=False,
-                 checkpoint: Optional[CheckpointManager] = None,
-                 stop_event: Optional[Event] = None):
+    def __init__(self, output_dir, image_downloader=None, page_workers=3,
+                 category_workers=2, max_in_flight=8, download_images=True,
+                 all_pages=False, checkpoint=None, stop_event=None):
         self.output_dir = output_dir
         self.download_images = download_images
         self.image_downloader = image_downloader
@@ -105,502 +67,343 @@ class EmagCrawler:
         self.category_workers = category_workers
         self.all_pages = all_pages
         self.cp = checkpoint or CheckpointManager(output_dir)
-
         self.global_semaphore = Semaphore(max_in_flight)
         self.exporters = Exporters(output_dir)
         self.stats: dict[str, CategoryStats] = {}
         self._stats_lock = Lock()
-
         self.errors_file = os.path.join(output_dir, "errors.csv")
-        self._error_lock = Lock()
-        self._error_header_written = False
-
+        self._error_lock = Lock(); self._error_header_written = False
         self.start_time = time.time()
         self._stop_event = stop_event or Event()
         self._interrupted = False
-
-        # 每线程 Session
         self._thread_local = threading.local()
-        self._session_config = {
-            "impersonate": "chrome136", "stealthy_headers": True,
-            "timeout": 30, "retries": 3, "retry_delay": 1,
-        }
-        self._all_sessions: list[tuple] = []
-        self._sessions_lock = Lock()
-
-        # 页面去重 (按类目URL隔离)
-        self._cat_page_hashes: dict[str, set] = {}
-        self._hash_lock = Lock()
-
+        self._session_config = {"impersonate": "chrome136", "stealthy_headers": True,
+                                "timeout": 30, "retries": 3, "retry_delay": 1}
+        self._all_sessions: list = []; self._sessions_lock = Lock()
+        self._cat_page_hashes: dict[str, set] = {}; self._hash_lock = Lock()
         os.makedirs(output_dir, exist_ok=True)
 
-    @property
-    def _waf_stop(self):
-        return self._stop_event
-
-    # ================================================================
-    # Session 管理
-    # ================================================================
+    # ---- Session ----
     def _get_client(self):
         if not hasattr(self._thread_local, 'client'):
             mgr = FetcherSession(**self._session_config)
-            try:
-                client = mgr.__enter__()
-            except Exception:
-                raise
-            self._thread_local.mgr = mgr
-            self._thread_local.client = client
-            with self._sessions_lock:
-                self._all_sessions.append((mgr, client))
+            client = mgr.__enter__()
+            self._thread_local.mgr = mgr; self._thread_local.client = client
+            with self._sessions_lock: self._all_sessions.append((mgr, client))
         return self._thread_local.client
 
     def _close_all_sessions(self):
         with self._sessions_lock:
             for mgr, client in list(self._all_sessions):
-                try:
-                    mgr.__exit__(None, None, None)
-                except Exception:
-                    pass
+                try: mgr.__exit__(None, None, None)
+                except Exception: pass
             self._all_sessions.clear()
 
-    # ================================================================
-    # 页面获取
-    # ================================================================
-    def _fetch_page(self, url: str) -> tuple[Optional[str], int]:
-        if self._stop_event.is_set():
-            return None, 0
+    # ---- 页面获取 ----
+    def _fetch_page(self, url):
+        if self._stop_event.is_set(): return None, 0
         with self.global_semaphore:
             try:
-                client = self._get_client()
-                page = client.get(url)
+                page = self._get_client().get(url)
                 return page.html_content, page.status
             except Exception as e:
-                logger.error(f"HTTP 请求失败 [{url}]: {e}")
+                logger.error(f"HTTP [{url}]: {e}")
                 return None, 0
 
-    # ================================================================
-    # 页面去重
-    # ================================================================
-    def _cat_key(self, base_url: str) -> str:
-        return base_url.lower().rstrip("/")
-
-    def _check_and_add_hash(self, cat_url: str, html: str) -> bool:
-        h = hashlib.md5(html.encode()).hexdigest()
-        ck = self._cat_key(cat_url)
+    # ---- 页面去重 ----
+    def _cat_key(self, base_url): return base_url.lower().rstrip("/")
+    def _check_and_add_hash(self, cat_url, html):
+        h = hashlib.md5(html.encode()).hexdigest(); ck = self._cat_key(cat_url)
         with self._hash_lock:
-            if ck not in self._cat_page_hashes:
-                self._cat_page_hashes[ck] = set()
-            if h in self._cat_page_hashes[ck]:
-                return True
-            self._cat_page_hashes[ck].add(h)
-            return False
+            if ck not in self._cat_page_hashes: self._cat_page_hashes[ck] = set()
+            if h in self._cat_page_hashes[ck]: return True
+            self._cat_page_hashes[ck].add(h); return False
 
-    # ================================================================
-    # 单页抓取和解析
-    # ================================================================
-    def _fetch_and_parse_page(self, name: str, base_url: str, page_num: int,
-                              page_url: str) -> PageResult:
-        """获取并解析单页, 返回 PageResult (含完整统计)"""
+    # ---- 单页解析 (纯工作线程, 不修改全局状态) ----
+    def _fetch_and_parse_page(self, name, base_url, page_num, page_url) -> PageResult:
         pr = PageResult(page_number=page_num, page_url=page_url)
-        html, status = self._fetch_page(page_url)
-        pr.http_status = status
+        html, st = self._fetch_page(page_url)
+        pr.http_status = st
 
-        waf = detect_waf_block(html or "", status, page_url, category=name, page_num=page_num)
-        if waf:
-            pr.waf_error = waf
-            return pr
-
-        if status != 200 or not html:
-            return pr
-
-        if not page_has_products(html):
-            pr.is_last_page = True
-            return pr
+        waf = detect_waf_block(html or "", st, page_url, category=name, page_num=page_num)
+        if waf: pr.waf_error = waf; return pr
+        if st != 200 or not html: return pr
+        if not page_has_products(html): pr.is_last_page = True; return pr
 
         pr.html_hash = hashlib.md5(html.encode()).hexdigest()
         pr.next_url = extract_next_page(html, page_url) or ""
         pr.has_next = bool(pr.next_url)
         pr.total_pages = extract_total_pages(html)
 
-        # 解析商品
-        products, parse_errors = self._parse_page_products(
-            html, name, base_url, page_url, page_num)
+        products, parse_errors = self._parse_products(html, name, base_url, page_url, page_num)
         pr.cards_found = len(products) + len(parse_errors)
         pr.products_parsed = len(products)
         pr.parse_failed = len(parse_errors)
         pr.parse_errors = parse_errors
-
-        # 去重
-        new_products = []
-        dup_count = 0
-        new_keys = []
-        for p in products:
-            key = get_product_key(p.to_dict())
-            if self.cp.has_product_key(key):
-                dup_count += 1
-            else:
-                self.cp.add_product_keys([key])
-                new_products.append(p)
-                new_keys.append(key)
-        pr.duplicates = dup_count
-        pr.new_unique_products = len(new_products)
-        pr.products = new_products
-        pr.product_keys = new_keys
-
-        # 校验统计一致性
-        if pr.cards_found > 0 and pr.products_parsed + pr.parse_failed < pr.cards_found:
-            logger.warning(f"[{name}] 第{page_num}页统计不一致: cards={pr.cards_found}, "
-                          f"parsed={pr.products_parsed}, failed={pr.parse_failed}")
-
+        # 保存全部解析成功的卡片 (不去重)
+        pr.all_products = list(products)
         return pr
 
-    def _parse_page_products(self, html: str, name: str, base_url: str,
-                             page_url: str, page_num: int) -> tuple:
-        """解析页面商品, 返回 (products, parse_errors)"""
-        if not html or len(html) < 100:
-            return [], []
-
+    def _parse_products(self, html, name, base_url, page_url, page_num):
+        if not html or len(html) < 100: return [], []
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "lxml")
         cards = soup.select(".card-item.card-standard.js-product-data")
         if not cards:
             cards = soup.select("[data-product-id]")
             cards = [c for c in cards if c.get("data-product-id")]
-
-        products = []
-        errors = []
-
+        products, errors = [], []
         for idx, card in enumerate(cards):
             try:
                 from parser import _parse_product_card
                 p = _parse_product_card(card, name, base_url, page_url, page_num)
-                if p:
-                    products.append(p)
+                if p: products.append(p)
                 else:
-                    pos = card.get("data-position", str(idx + 1))
-                    pid = card.get("data-product-id", "")
-                    errors.append({
-                        "position": pos, "product_id": pid,
-                        "error_type": "PARSE_FAILED",
-                        "error_detail": "商品卡片解析返回 None",
-                    })
+                    pos = card.get("data-position", str(idx+1)); pid = card.get("data-product-id","")
+                    errors.append({"position": pos, "product_id": pid,
+                                   "error_type": "PARSE_FAILED", "error_detail": "解析返回None"})
             except Exception as e:
-                pos = card.get("data-position", str(idx + 1))
-                pid = card.get("data-product-id", "")
-                errors.append({
-                    "position": pos, "product_id": pid,
-                    "error_type": type(e).__name__,
-                    "error_detail": str(e)[:200],
-                })
-                logger.warning(f"[{name}] 第{page_num}页 位置{pos}: 解析异常 {e}")
-
+                pos = card.get("data-position", str(idx+1)); pid = card.get("data-product-id","")
+                errors.append({"position": pos, "product_id": pid,
+                               "error_type": type(e).__name__, "error_detail": str(e)[:200]})
         return products, errors
 
-    # ================================================================
-    # 类目抓取
-    # ================================================================
-    def crawl_category(self, name: str, url: str, max_pages: Optional[int] = None,
-                       resume_from: int = 1) -> CategoryStats:
+    # ---- 类目抓取 ----
+    def crawl_category(self, name, url, max_pages=None, resume_from=1):
         stats = CategoryStats(name, url)
-        with self._stats_lock:
-            self.stats[name] = stats
+        with self._stats_lock: self.stats[name] = stats
+        hard_limit = max_pages if max_pages is not None else (ALL_PAGES_LIMIT if self.all_pages else 1)
+        if resume_from > 1: logger.info(f"[{name}] 从第{resume_from}页恢复")
 
-        if max_pages is not None:
-            hard_limit = max_pages
-        elif self.all_pages:
-            hard_limit = ALL_PAGES_LIMIT
-        else:
-            hard_limit = 1
-
-        if resume_from > 1:
-            logger.info(f"[{name}] 从第{resume_from}页恢复")
-        logger.info(f"[{name}] 开始抓取: {url} (限制: {hard_limit} 页)")
-
-        cat_id = self.cp.get_category(url)
-        if not cat_id:
+        if not self.cp.get_category(url):
             self.cp.init_category(name, url, effective_pages=hard_limit)
 
         # --- 首页 ---
         if resume_from == 1:
-            pr = self._fetch_and_parse_page(name, url, 1, url)
-            stats.requested_pages += 1
-
+            pr = self._fetch_and_parse_page(name, url, 1, url); stats.requested_pages += 1
             if pr.waf_error:
-                self._handle_waf_block(pr.waf_error, name, 1, url, "")
-                stats.end_time = time.time()
-                return stats
-
+                self._handle_stop(RunStatus.PAUSED_WAF, name, 1, pr.page_url,
+                                  pr.waf_error, getattr(pr, '_html', "")); return stats
             if pr.http_status != 200:
                 stats.failed_pages += 1
-                self._log_error(name, 1, url, "HTTP_ERROR", pr.http_status, f"HTTP {pr.http_status}")
-                self.cp.set_paused("network_error")
-                stats.end_time = time.time()
+                self._handle_stop(RunStatus.PAUSED_NETWORK, name, 1, url, None, "")
                 return stats
-
             if pr.cards_found == 0 and pr.is_last_page:
-                logger.info(f"[{name}] 类目为空")
                 stats.stop_reason = "empty_category"
-                self.cp.mark_category_done(url, "empty_category")
-                stats.end_time = time.time()
+                self.cp.mark_category_done(url, "empty_category"); return stats
+            # 全部解析失败检查
+            if pr.cards_found > 0 and pr.products_parsed == 0 and pr.parse_failed > 0:
+                self._commit_page_errors(name, url, pr)
+                self.cp.mark_page_partial(url, 1)
+                stats.stop_reason = "parse_error"
+                self.cp.set_status(RunStatus.FAILED, "all_parse_failed_page1")
                 return stats
-
             self._commit_page(name, url, pr, stats)
-
-            # 根据首页信息调整有效页数
-            if pr.total_pages:
-                actual = pr.total_pages
-                effective = min(hard_limit, actual)
-                self.cp.update_category(url, effective_pages=effective)
-                logger.info(f"[{name}] 实际总页数: {actual}, 有效页数: {effective}")
-            else:
-                effective = hard_limit
-
-            if effective <= 1 or not pr.has_next:
+            effective = min(hard_limit, pr.total_pages) if pr.total_pages else hard_limit
+            self.cp.update_category(url, effective_pages=effective)
+            if hard_limit <= 1 or not pr.has_next:
                 stats.stop_reason = "no_next_page" if not pr.has_next else "requested_limit_reached"
-                self.cp.mark_category_done(url, stats.stop_reason)
-                stats.end_time = time.time()
-                return stats
+                self.cp.mark_category_done(url, stats.stop_reason); return stats
         else:
             effective = hard_limit
 
-        # --- 后续页面: 并发获取 + 按序提交 ---
+        # --- 并发后续页 ---
         import re as _re
         url_template = None
         if resume_from == 1 and pr.has_next:
             m = _re.match(r'(.*?/p)(\d+)(/c.*)', pr.next_url)
-            if m:
-                url_template = (m.group(1), m.group(3))
+            if m: url_template = (m.group(1), m.group(3))
         elif resume_from > 1:
             m = _re.match(r'(.*?/p)(\d+)(/c.*)', url)
-            if m:
-                url_template = (m.group(1), m.group(3))
+            if m: url_template = (m.group(1), m.group(3))
 
         start_page = max(resume_from, 2)
         pending = list(range(start_page, effective + 1))
         completed_buf: dict[int, PageResult] = {}
         in_flight: dict[Future, int] = {}
-        next_idx = 0
-        stopped = False
+        next_idx, stopped = 0, False
         lock = Lock()
 
-        with ThreadPoolExecutor(max_workers=self.page_workers) as executor:
+        with ThreadPoolExecutor(max_workers=self.page_workers) as ex:
             while next_idx < len(pending) and len(in_flight) < self.page_workers:
-                if self._stop_event.is_set():
-                    stopped = True; break
+                if self._stop_event.is_set(): stopped = True; break
                 pn = pending[next_idx]
-                purl = self._make_page_url(url_template, pn) if url_template else None
-                if not purl:
-                    stopped = True; break
-                fut = executor.submit(self._fetch_and_parse_page, name, url, pn, purl)
-                in_flight[fut] = pn
-                stats.requested_pages += 1
-                next_idx += 1
+                pu = f"{url_template[0]}{pn}{url_template[1]}" if url_template else None
+                if not pu: stopped = True; break
+                fut = ex.submit(self._fetch_and_parse_page, name, url, pn, pu)
+                in_flight[fut] = pn; stats.requested_pages += 1; next_idx += 1
 
             next_expected = start_page
             while in_flight and not stopped:
                 done = [f for f in in_flight if f.done()]
-                if not done:
-                    time.sleep(0.01); continue
-
+                if not done: time.sleep(0.01); continue
                 for fut in done:
                     pn = in_flight.pop(fut)
-                    try:
-                        result = fut.result()
-                    except Exception as e:
-                        completed_buf[pn] = PageResult(page_number=pn, http_status=0)
-                        continue
-                    completed_buf[pn] = result
+                    try: completed_buf[pn] = fut.result()
+                    except Exception as e: completed_buf[pn] = PageResult(page_number=pn, http_status=0)
 
                 with lock:
                     while next_expected in completed_buf and not stopped:
                         pr = completed_buf.pop(next_expected)
-
                         if pr.waf_error:
-                            self._handle_waf_block(pr.waf_error, name, next_expected, pr.page_url, "")
-                            self._stop_event.set()
-                            stopped = True; break
-
+                            self._handle_stop(RunStatus.PAUSED_WAF, name, next_expected,
+                                            pr.page_url, pr.waf_error, "")
+                            self._stop_event.set(); stopped = True; break
                         if pr.http_status != 200:
                             stats.failed_pages += 1
-                            self._log_error(name, next_expected, pr.page_url, "HTTP_ERROR",
-                                          pr.http_status, f"HTTP {pr.http_status}")
-                            stats.stop_reason = "network_error"
-                            self.cp.set_paused("network_error")
+                            self._handle_stop(RunStatus.PAUSED_NETWORK, name, next_expected,
+                                            pr.page_url, None, f"HTTP {pr.http_status}")
                             stopped = True; break
-
                         if pr.cards_found == 0:
-                            stats.stop_reason = "empty_page"
-                            self.cp.mark_category_done(url, "empty_page")
+                            self.cp.mark_category_done(url, "empty_page"); stopped = True; break
+                        # 全部解析失败
+                        if pr.cards_found > 0 and pr.products_parsed == 0 and pr.parse_failed > 0:
+                            self._commit_page_errors(name, url, pr)
+                            self.cp.mark_page_partial(url, next_expected)
+                            self.cp.set_status(RunStatus.FAILED, f"all_parse_failed_p{next_expected}")
                             stopped = True; break
-
                         self._commit_page(name, url, pr, stats)
-
                         if not pr.has_next or pr.is_last_page:
                             stats.stop_reason = "actual_last_page_reached"
-                            self.cp.mark_category_done(url, stats.stop_reason)
-                            stopped = True; break
-
+                            self.cp.mark_category_done(url, stats.stop_reason); stopped = True; break
                         next_expected += 1
 
                 while (not stopped and not self._stop_event.is_set()
-                       and next_idx < len(pending)
-                       and len(in_flight) < self.page_workers):
+                       and next_idx < len(pending) and len(in_flight) < self.page_workers):
                     pn = pending[next_idx]
-                    purl = self._make_page_url(url_template, pn) if url_template else None
-                    if not purl:
-                        stopped = True; break
-                    fut = executor.submit(self._fetch_and_parse_page, name, url, pn, purl)
-                    in_flight[fut] = pn
-                    stats.requested_pages += 1
-                    next_idx += 1
+                    pu = f"{url_template[0]}{pn}{url_template[1]}" if url_template else None
+                    if not pu: stopped = True; break
+                    fut = ex.submit(self._fetch_and_parse_page, name, url, pn, pu)
+                    in_flight[fut] = pn; stats.requested_pages += 1; next_idx += 1
 
-            for fut in list(in_flight.keys()):
-                fut.cancel()
+            for fut in list(in_flight.keys()): fut.cancel()
 
         if not stats.stop_reason:
             stats.stop_reason = "requested_limit_reached"
             self.cp.mark_category_done(url, stats.stop_reason)
         stats.end_time = time.time()
-        logger.info(f"[{name}] 完成: 成功 {stats.success_pages} 页, "
-                    f"商品 {stats.total_records} 条, 耗时 {stats.elapsed:.1f}s, "
-                    f"原因: {stats.stop_reason}")
         return stats
 
-    def _commit_page(self, name: str, base_url: str, pr: PageResult, stats: CategoryStats):
-        """提交单个页面: 快照 + 去重登记 + checkpoint 更新"""
+    def _commit_page(self, name, base_url, pr: PageResult, stats: CategoryStats):
+        """按序提交: 去重在锁内原子完成, 输出去重前后数据"""
         self._check_and_add_hash(base_url, pr.html_hash) if pr.html_hash else None
 
-        # 记录解析错误到 errors.csv
         for err in pr.parse_errors:
-            self._log_error(name, pr.page_number, pr.page_url,
-                          err.get("error_type", "PARSE_FAILED"),
-                          detail=err.get("error_detail", ""),
-                          product_key=err.get("product_id", ""))
+            self._log_error(name, pr.page_number, pr.page_url, err.get("error_type","PARSE_FAILED"),
+                          detail=err.get("error_detail",""), product_key=err.get("product_id",""))
 
-        if pr.products:
-            self.cp.save_page_snapshot(base_url, pr.page_number, pr.products)
-            self.exporters.add_products(pr.products)
+        # S0-7: 输出全部解析成功的卡片 (all_products), 不管重复
+        all_prods = pr.all_products
+        if all_prods:
+            self.cp.save_page_snapshot(base_url, pr.page_number, all_prods)
+
+        # S0-6: 去重在锁内原子完成
+        new_products, dup_count = [], 0
+        new_keys = []
+        if all_prods:
+            all_keys = [get_product_key(p.to_dict()) for p in all_prods]
+            added_keys, dup_count = self.cp.check_and_add_product_keys(all_keys)
+            # 用 added_keys 筛选新增商品
+            added_set = set(added_keys)
+            new_products = [p for p in all_prods if get_product_key(p.to_dict()) in added_set]
+            new_keys = added_keys
+
+        pr.new_unique_products = len(new_products)
+        pr.duplicates = dup_count
+        pr.products = new_products
+        pr.product_keys = new_keys
+
+        # 全部成功卡片都写入 Exporters
+        for p in all_prods:
+            self.exporters.add_product(p)
 
         stats.success_pages += 1
-        stats.total_records += len(pr.products)
+        stats.total_records += len(all_prods)  # S0-7: 总记录=全部卡片
         stats.cards_found += pr.cards_found
         stats.products_parsed += pr.products_parsed
         stats.parse_failed += pr.parse_failed
-        stats.duplicates += pr.duplicates
-        stats.new_unique += pr.new_unique_products
+        stats.duplicates += dup_count
+        stats.new_unique += len(new_products)
 
         self.cp.mark_page_completed(base_url, pr.page_number,
-                                    cards_found=pr.cards_found,
-                                    products_parsed=pr.products_parsed,
-                                    parse_failed=pr.parse_failed,
-                                    duplicates=pr.duplicates,
-                                    new_unique=pr.new_unique_products)
+            cards_found=pr.cards_found, products_parsed=pr.products_parsed,
+            parse_failed=pr.parse_failed, duplicates=dup_count,
+            new_unique=len(new_products))
 
-        if pr.parse_failed > 0 and pr.products_parsed == 0:
-            self.cp.mark_page_partial(base_url, pr.page_number)
-            stats.stop_reason = "parse_error"
-            logger.warning(f"[{name}] 第{pr.page_number}页全部解析失败!")
+        logger.info(f"[{name}] P{pr.page_number}: cards={pr.cards_found} "
+                    f"parsed={pr.products_parsed} fail={pr.parse_failed} "
+                    f"dup={dup_count} new={len(new_products)}")
 
-        logger.info(f"[{name}] 第{pr.page_number}页: cards={pr.cards_found}, "
-                    f"parsed={pr.products_parsed}, failed={pr.parse_failed}, "
-                    f"dup={pr.duplicates}, new={pr.new_unique_products}")
+    def _commit_page_errors(self, name, base_url, pr: PageResult):
+        """只记录解析错误, 不标记完成"""
+        for err in pr.parse_errors:
+            self._log_error(name, pr.page_number, pr.page_url, err.get("error_type","PARSE_FAILED"),
+                          detail=err.get("error_detail",""), product_key=err.get("product_id",""))
 
-    def _make_page_url(self, template, page_num):
-        if not template:
-            return None
-        return f"{template[0]}{page_num}{template[1]}"
+    def _make_page_url(self, t, n): return f"{t[0]}{n}{t[1]}" if t else None
 
-    # ================================================================
-    # 类目调度
-    # ================================================================
+    # ---- 类目调度 ----
     def crawl_all_categories(self, categories, max_pages=None):
-        if not categories:
-            return {}
-        logger.info(f"共 {len(categories)} 个类目, 并发: {self.category_workers}")
-        results = {}
-
+        if not categories: return {}
         for cat in categories:
-            if self._stop_event.is_set():
-                break
-            cat_url = cat["url"]
-            cp_cat = self.cp.get_category(cat_url)
-            if cp_cat and cp_cat.get("status") == "completed":
-                logger.info(f"[{cat['name']}] 已完成, 跳过")
-                continue
-            resume_from = cp_cat["next_page"] if cp_cat else 1
-            results[cat["name"]] = self.crawl_category(cat["name"], cat_url, max_pages, resume_from)
+            if self._stop_event.is_set(): break
+            cu = cat["url"]; cc = self.cp.get_category(cu)
+            status = self.cp.get_status()
+            if status.is_stopped: break
+            if cc and cc.get("status") == "completed": continue
+            rf = cc["next_page"] if cc else 1
+            self.crawl_category(cat["name"], cu, max_pages, rf)
+            if self.cp.get_status().is_stopped: break
+        return {}
 
-        return results
-
-    # ================================================================
-    # WAF 处理
-    # ================================================================
-    def _handle_waf_block(self, waf, name, page_num, url, html):
+    # ---- 统一停止处理 ----
+    def _handle_stop(self, status: RunStatus, name, page_num, url, waf=None, detail=""):
         self._stop_event.set()
-        saved = self.exporters.get_product_count()
         ts = datetime.now(timezone.utc).isoformat()
-        self._log_error(name, page_num, url, f"WAF_{waf.block_type}", waf.status_code, detail=waf.evidence)
+        if waf:
+            self._log_error(name, page_num, url, f"WAF_{waf.block_type}", waf.status_code, detail=waf.evidence)
+            diag_dir = os.path.join(self.output_dir, "diagnostics")
+            os.makedirs(diag_dir, exist_ok=True)
+            write_atomic_json(os.path.join(diag_dir, "captcha_diagnostic.json"),
+                {"status": "waf_blocked", "timestamp": ts, "category": name,
+                 "page": page_num, "url": url, "http_status": waf.status_code,
+                 "block_type": waf.block_type, "evidence": waf.evidence})
+        else:
+            self._log_error(name, page_num, url, f"NETWORK_ERROR", detail=detail)
 
-        diag_dir = os.path.join(self.output_dir, "diagnostics")
-        os.makedirs(diag_dir, exist_ok=True)
-        diagnostic = {"status": "waf_blocked", "timestamp": ts,
-                      "category": name, "page": page_num, "url": url,
-                      "http_status": waf.status_code, "block_type": waf.block_type,
-                      "evidence": waf.evidence, "products_saved": saved}
-        write_atomic_json(os.path.join(diag_dir, "captcha_diagnostic.json"), diagnostic)
-
-        if html:
-            import re as _re
-            s = html
-            s = _re.sub(r'apiKey["\']?\s*[:=]\s*["\'][^"\']+["\']', 'apiKey="[REDACTED]"', s)
-            s = _re.sub(r'cookieValue=([^&\s"\'<>]+)', 'cookieValue=[REDACTED]', s)
-            with open(os.path.join(diag_dir, "captcha_response.html"), "w", encoding="utf-8") as f:
-                f.write(s)
-
-        self.cp.set_paused("waf_blocked", last_error=diagnostic)
+        self.cp.set_status(status, status.value)
 
         sys_mod = __import__('sys')
-        print("\n" + "!" * 60, file=sys_mod.stderr)
-        print("  检测到eMAG验证码、WAF或访问限制，任务已停止。进度已保存。", file=sys_mod.stderr)
-        print("!" * 60, file=sys_mod.stderr)
-        for k, v in [("HTTP状态码", waf.status_code), ("类目", name), ("页码", page_num),
-                     ("URL", url), ("阻断类型", waf.block_type), ("已保存商品", saved)]:
-            print(f"  {k}: {v}", file=sys_mod.stderr)
+        if status == RunStatus.PAUSED_WAF:
+            print(f"\n{'!'*60}\n  检测到WAF/验证码，任务已停止。进度已保存。\n{'!'*60}", file=sys_mod.stderr)
+        else:
+            print(f"\n{'!'*60}\n  网络错误，任务已暂停。进度已保存。\n{'!'*60}", file=sys_mod.stderr)
+
+        print(f"  HTTP状态码: {waf.status_code if waf else detail}", file=sys_mod.stderr)
+        print(f"  类目: {name}  页码: {page_num}", file=sys_mod.stderr)
         self._print_resume_help()
-        print("!" * 60 + "\n", file=sys_mod.stderr)
 
     def _print_resume_help(self):
         cp_path = os.path.abspath(self.cp.checkpoint_path)
-        sys_mod = __import__('sys')
-        print(f"\n  继续命令:", file=sys_mod.stderr)
-        print(f'  .venv\\Scripts\\python.exe main.py --resume "{cp_path}"', file=sys_mod.stderr)
-        print(f"\n  也可以双击: {os.path.join(self.output_dir, 'resume.bat')}", file=sys_mod.stderr)
+        s = __import__('sys')
+        print(f"\n  继续命令:", file=s.stderr)
+        print(f'  .venv\\Scripts\\python.exe main.py --resume "{cp_path}"', file=s.stderr)
+        print(f"  或双击: {os.path.join(self.output_dir, 'resume.bat')}", file=s.stderr)
         self._write_resume_files()
 
     def _write_resume_files(self):
         cp_path = os.path.abspath(self.cp.checkpoint_path)
-        proj_dir = os.path.abspath(os.path.join(os.path.dirname(__file__)))
-
-        # RESUME_COMMAND.txt
+        proj = os.path.abspath(os.path.join(os.path.dirname(__file__)))
         with open(os.path.join(self.output_dir, "RESUME_COMMAND.txt"), "w", encoding="utf-8") as f:
-            f.write(f'cd /d "{proj_dir}"\n')
-            f.write(f'.venv\\Scripts\\python.exe main.py --resume "{cp_path}"\n')
-
-        # resume.bat
+            f.write(f'cd /d "{proj}"\n.venv\\Scripts\\python.exe main.py --resume "{cp_path}"\n')
         with open(os.path.join(self.output_dir, "resume.bat"), "w", encoding="utf-8", newline="\r\n") as f:
-            f.write('@echo off\n')
-            f.write('chcp 65001 >nul\n')
-            f.write(f'cd /d "{proj_dir}"\n')
-            f.write(f'echo Resuming task...\n')
+            f.write('@echo off\nchcp 65001 >nul\n')
+            f.write(f'cd /d "{proj}"\n')
             f.write(f'".venv\\Scripts\\python.exe" main.py --resume "{cp_path}"\n')
-            f.write('echo Exit code: %ERRORLEVEL%\n')
-            f.write('pause\n')
+            f.write('echo Exit code: %ERRORLEVEL%\npause\n')
 
-    # ================================================================
-    # 错误记录
-    # ================================================================
-    ERROR_FIELDNAMES = ["时间", "类目", "页码", "商品键", "URL", "错误类型", "HTTP状态码", "重试次数", "错误详情"]
-
+    # ---- 错误 ----
+    ERROR_FIELDNAMES = ["时间","类目","页码","商品键","URL","错误类型","HTTP状态码","重试次数","错误详情"]
     def _log_error(self, name, page, url, error_type, http_status=0, retries=0, detail="", product_key=""):
         d = {"时间": datetime.now(timezone.utc).isoformat(), "类目": name, "页码": page,
              "商品键": product_key, "URL": url, "错误类型": error_type,
@@ -608,30 +411,23 @@ class EmagCrawler:
         with self._error_lock:
             write_errors_csv(self.errors_file, d, write_header=not self._error_header_written,
                            fieldnames=self.ERROR_FIELDNAMES)
-            if not self._error_header_written:
-                self._error_header_written = True
+            if not self._error_header_written: self._error_header_written = True
 
     def _log_image_errors(self, img_stats):
         for err in img_stats.get("errors", []):
-            self._log_error(name=err.get("category", ""), page=err.get("page", 0),
-                          url=err.get("image_url", err.get("url", "")),
-                          error_type=err.get("error_type", "IMAGE_ERROR"),
-                          http_status=err.get("http_status", 0),
-                          detail=err.get("error_detail", str(err)),
-                          product_key=err.get("product_key", ""))
+            self._log_error(name=err.get("category",""), page=err.get("page",0),
+                url=err.get("image_url", err.get("url","")),
+                error_type=err.get("error_type","IMAGE_ERROR"),
+                http_status=err.get("http_status",0),
+                detail=err.get("error_detail",str(err)),
+                product_key=err.get("product_key",""))
 
-    # ================================================================
-    # 图片下载
-    # ================================================================
     def download_images_for_products(self):
-        if not self.image_downloader:
-            return {}
+        if not self.image_downloader: return {}
         return self.image_downloader.download_batch(self.exporters.get_products_sorted())
 
-    # ================================================================
-    # 完成导出
-    # ================================================================
-    def finalize(self, interrupted=False, paused_reason="") -> dict:
+    # ---- finalize ----
+    def finalize(self, interrupted=False):
         total_elapsed = time.time() - self.start_time
         self._close_all_sessions()
 
@@ -640,15 +436,13 @@ class EmagCrawler:
         if self.download_images and self.image_downloader and not self._stop_event.is_set():
             path_map = self.download_images_for_products()
             image_stats = self.image_downloader.get_stats()
-        if image_stats.get("errors"):
-            self._log_image_errors(image_stats)
+        if image_stats.get("errors"): self._log_image_errors(image_stats)
 
         if path_map:
             with self.exporters._lock:
                 for item in self.exporters._products:
                     key = get_product_key(item)
-                    if key in path_map:
-                        item["main_image_local_path"] = path_map[key]
+                    if key in path_map: item["main_image_local_path"] = path_map[key]
 
         sorted_prods = self.exporters.get_products_sorted()
         total_records = len(sorted_prods)
@@ -656,51 +450,41 @@ class EmagCrawler:
 
         with self._stats_lock:
             for name, stats in self.stats.items():
-                img_ok = 0; img_fail = 0
-                cat_keys = set(); cat_count = 0
+                img_ok = 0; img_fail = 0; cat_keys = set(); cat_count = 0
                 for item in sorted_prods:
                     if item.get("category_name") == name:
-                        cat_count += 1
-                        cat_keys.add(get_product_key(item))
-                        if item.get("main_image_local_path"):
-                            img_ok += 1
-                        elif item.get("main_image_url"):
-                            img_fail += 1
+                        cat_count += 1; cat_keys.add(get_product_key(item))
+                        if item.get("main_image_local_path"): img_ok += 1
+                        elif item.get("main_image_url"): img_fail += 1
                 stats.total_records = cat_count
                 stats.unique_products = len(cat_keys)
-                stats.image_success = img_ok
-                stats.image_failed = img_fail
+                stats.image_success = img_ok; stats.image_failed = img_fail
 
         ensure_errors_csv(self.errors_file, self.ERROR_FIELDNAMES)
         self.exporters.finalize()
 
+        # S0-4/5: 统一状态判定
         if interrupted:
-            self.cp.set_interrupted()
-            status = "interrupted"
-        elif self._stop_event.is_set():
-            if not self.cp.data.get("status", "").startswith("paused"):
-                self.cp.set_paused(paused_reason or "waf_blocked")
-            status = self.cp.data["status"]
-        else:
-            self.cp.set_completed()
-            status = "completed"
+            self.cp.set_status(RunStatus.INTERRUPTED)
+        elif not self.cp.get_status().is_stopped:
+            self.cp.set_status(RunStatus.COMPLETED)
 
+        status = self.cp.get_status()
         summary = {
-            "version": "2.1.1",
-            "status": status,
+            "version": "2.1.1", "status": status.value,
             "start_time": datetime.fromtimestamp(self.start_time, tz=timezone.utc).isoformat(),
             "end_time": datetime.now(timezone.utc).isoformat(),
             "elapsed_seconds": round(total_elapsed, 2),
             "categories": [s.to_dict() for s in self.stats.values()],
-            "totals": {
-                "total_records": total_records,
-                "unique_products": len(unique_keys),
+            "totals": {"total_records": total_records, "unique_products": len(unique_keys),
                 "image_download_success": image_stats["success"],
                 "image_download_failed": image_stats["failed"],
                 "success_pages": sum(s.success_pages for s in self.stats.values()),
-                "failed_pages": sum(s.failed_pages for s in self.stats.values()),
-            },
+                "failed_pages": sum(s.failed_pages for s in self.stats.values())},
         }
         write_atomic_json(os.path.join(self.output_dir, "run_summary.json"), summary)
-        logger.info(f"汇总已写入, 状态: {status}")
+        logger.info(f"汇总: status={status.value}")
         return summary
+
+    def get_exit_code(self):
+        return self.cp.get_status().exit_code
