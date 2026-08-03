@@ -10,7 +10,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from utils import (
-    load_txt_categories, detect_captcha, CaptchaRequiredError,
+    load_txt_categories, detect_captcha, detect_waf_block,
+    WafBlockError, CaptchaRequiredError,
     get_product_key, write_atomic_json,
     EXIT_CONFIG_ERROR, EXIT_CAPTCHA, EXIT_NETWORK_ERROR,
 )
@@ -129,44 +130,59 @@ CLOUDFLARE_CHALLENGE = """<html><head><title>Just a moment...</title></head>
 
 class TestCaptchaDetection:
     def test_aws_waf_captcha_page(self):
-        err = detect_captcha(AWS_WAF_HTML, 200, "https://www.emag.ro/mouse/c")
+        err = detect_waf_block(AWS_WAF_HTML, 200, "https://www.emag.ro/mouse/c")
         assert err is not None
-        assert "AWS_WAF" in err.captcha_type
+        assert "AWS_WAF" in err.block_type
 
     def test_http_511_with_waf_markers(self):
-        err = detect_captcha(AWS_WAF_511, 511, "https://www.emag.ro/mouse/c")
+        # 511 always triggers WAF (regardless of body)
+        err = detect_waf_block(AWS_WAF_511, 511, "https://www.emag.ro/mouse/c")
         assert err is not None
         assert err.status_code == 511
 
     def test_normal_page_no_captcha(self):
-        err = detect_captcha(NORMAL_PRODUCT_PAGE, 200, "https://www.emag.ro/mouse/c")
+        err = detect_waf_block(NORMAL_PRODUCT_PAGE, 200, "https://www.emag.ro/mouse/c")
         assert err is None
 
     def test_403_with_captcha(self):
+        # All 403s now trigger WAF unconditionally
         html = "<html><head><title>Access Denied</title></head><body>captcha verification</body></html>"
-        err = detect_captcha(html, 403, "https://www.emag.ro/mouse/c")
+        err = detect_waf_block(html, 403, "https://www.emag.ro/mouse/c")
         assert err is not None
+        assert err.status_code == 403
 
-    def test_403_normal_block_no_captcha(self):
-        """普通 403 (非验证码) 不应触实验证码检测"""
+    def test_all_403_triggers_waf(self):
+        """V2.0.2: 所有 403 统一视为 WAF 阻断"""
         html = "<html><body>Forbidden</body></html>"
-        err = detect_captcha(html, 403, "https://www.emag.ro/mouse/c")
-        # 403 with "Forbidden" but no captcha keywords
-        assert err is None
+        err = detect_waf_block(html, 403, "https://www.emag.ro/mouse/c")
+        assert err is not None
+        assert "HTTP_403" in err.block_type
+
+    def test_all_429_triggers_waf(self):
+        """V2.0.2: 所有 429 统一视为 WAF 阻断"""
+        err = detect_waf_block("<html></html>", 429, "https://www.emag.ro/mouse/c")
+        assert err is not None
+        assert "HTTP_429" in err.block_type
+
+    def test_all_511_triggers_waf(self):
+        """V2.0.2: 所有 511 统一视为 WAF 阻断, 即使正文不含 captcha"""
+        err = detect_waf_block("<html><body>plain text</body></html>", 511, "https://www.emag.ro/mouse/c")
+        assert err is not None
+        assert err.status_code == 511
 
     def test_200_with_emag_captcha_title(self):
         html = "<html><head><title>eMAG Captcha</title></head><body></body></html>"
-        err = detect_captcha(html, 200, "https://www.emag.ro/mouse/c")
+        err = detect_waf_block(html, 200, "https://www.emag.ro/mouse/c")
         assert err is not None
 
     def test_empty_html(self):
-        assert detect_captcha("", 200, "") is None
+        assert detect_waf_block("", 200, "") is None
 
     def test_captcha_error_is_exception(self):
-        err = CaptchaRequiredError(511, "Mouse", 1, "url", "TEST", "evidence")
+        err = WafBlockError(511, "Mouse", 1, "url", "TEST", "evidence")
         assert isinstance(err, Exception)
         assert err.status_code == 511
-        assert err.captcha_type == "TEST"
+        assert err.block_type == "TEST"
 
 
 # ============================================================

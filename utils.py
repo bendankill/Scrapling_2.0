@@ -1,5 +1,6 @@
 """
-工具函数：日志、价格解析、URL处理、TXT配置加载、Captcha检测、产品键
+工具函数：日志、价格解析、URL处理、TXT配置加载、WAF/Captcha检测、产品键
+V2.0.2 — 403/429/511 统一视为WAF阻断
 """
 import re
 import os
@@ -11,6 +12,7 @@ import hashlib
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 
 # ============================================================
@@ -19,34 +21,39 @@ from typing import Optional
 EXIT_SUCCESS = 0           # 成功且抓到商品
 EXIT_CONFIG_ERROR = 1      # 配置或参数错误
 EXIT_NETWORK_ERROR = 2     # 网络、解析或全部页面失败
-EXIT_CAPTCHA = 3           # 检测到验证码/WAF，需要人工处理
+EXIT_CAPTCHA = 3           # 检测到验证码/WAF/403/429/511, 需要人工处理
 EXIT_INTERRUPT = 130       # 用户中断 (Ctrl+C)
 
 
 # ============================================================
 # 自定义异常
 # ============================================================
-class CaptchaRequiredError(Exception):
-    """检测到验证码或WAF人工验证, 必须人工处理后重新运行"""
+class WafBlockError(Exception):
+    """检测到WAF/验证码/访问限制, 必须人工处理后重新运行"""
     def __init__(self, status_code: int, category: str, page: int, url: str,
-                 captcha_type: str, evidence: str):
+                 block_type: str, evidence: str):
         self.status_code = status_code
         self.category = category
         self.page = page
         self.url = url
-        self.captcha_type = captcha_type
+        self.block_type = block_type
         self.evidence = evidence
-        super().__init__(f"[{captcha_type}] HTTP {status_code} at {url}")
+        super().__init__(f"[{block_type}] HTTP {status_code} at {url}")
+
+
+# 保持旧名兼容
+CaptchaRequiredError = WafBlockError
 
 
 # ============================================================
-# TXT 类目配置加载
+# TXT 类目配置加载 (使用 urllib.parse)
 # ============================================================
 def load_txt_categories(filepath: str) -> list[dict]:
     """
     从 categories.txt 加载类目配置。
     每行一个URL，忽略空行和 # 开头的注释行。
     自动从URL路径生成类目名称。
+    使用 urllib.parse 进行URL校验。
     """
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"配置文件不存在: {filepath}")
@@ -69,22 +76,38 @@ def load_txt_categories(filepath: str) -> list[dict]:
     seen_urls = set()
 
     for line_num, raw, url in lines:
-        # 验证协议和域名
-        if not (url.startswith("https://www.emag.ro/") or url.startswith("https://emag.ro/")):
-            errors.append((line_num, raw, "URL 必须是 https://www.emag.ro/ 或 https://emag.ro/ 开头"))
+        # 使用 urllib.parse 解析
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            errors.append((line_num, raw, "URL 无法解析"))
             continue
 
-        # 验证是 /c 类目路径, 拒绝 /pd/ 商品详情页
-        if "/pd/" in url:
+        # 协议检查
+        if parsed.scheme not in ("http", "https"):
+            errors.append((line_num, raw, f"不支持的协议: {parsed.scheme}，仅支持 http/https"))
+            continue
+
+        # 域名检查
+        hostname = (parsed.hostname or "").lower()
+        valid_hosts = ("www.emag.ro", "emag.ro")
+        if hostname not in valid_hosts:
+            errors.append((line_num, raw, f"域名必须是 www.emag.ro 或 emag.ro，当前: {hostname}"))
+            continue
+
+        # 路径检查: 必须是 /.../c 格式，拒绝 /pd/
+        path = parsed.path.rstrip("/")
+        if "/pd/" in path:
             errors.append((line_num, raw, "URL 是商品详情页 /pd/，不是类目 /c 路径"))
             continue
 
-        if "/c" not in url.split("?")[0]:
-            errors.append((line_num, raw, "URL 不是有效的类目路径 (缺少 /c)"))
+        # 必须以 /c 结尾 (例如 /mouse/c 或 /laptop/accesorii-laptop/c)
+        if not path.endswith("/c"):
+            errors.append((line_num, raw, f"URL 路径必须以 /c 结尾 (类目路径)，当前路径: {path}"))
             continue
 
-        # 去重
-        normalized = url.lower().rstrip("/")
+        # 去重 (忽略尾部斜杠、大小写)
+        normalized = (hostname + path).lower()
         if normalized in seen_urls:
             print(f"[警告] 第{line_num}行 URL 重复，已跳过: {url}", file=sys.stderr)
             continue
@@ -94,7 +117,6 @@ def load_txt_categories(filepath: str) -> list[dict]:
         name = _category_name_from_url(url, len(categories) + 1)
         categories.append({"name": name, "url": url, "enabled": True})
 
-    # 打印全部错误
     if errors:
         print("[错误] 类目配置文件存在以下问题:", file=sys.stderr)
         for line_num, raw, reason in errors:
@@ -109,94 +131,88 @@ def load_txt_categories(filepath: str) -> list[dict]:
 
 
 def _category_name_from_url(url: str, index: int) -> str:
-    """从 eMAG 类目 URL 路径中提取名称，例如 /mouse/c → Mouse"""
-    # 去掉查询参数
-    path = url.split("?")[0]
-    # 去掉尾部斜杠
-    path = path.rstrip("/")
-    # 提取路径最后一个 /c 之前的词: /mouse/c → mouse
+    """从 eMAG 类目 URL 路径中提取名称"""
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
     parts = path.split("/")
+    # 找 /c 前面的部分: /mouse/c → mouse, /laptop/accesorii/c → accesorii
     for i, part in enumerate(parts):
         if part == "c" and i > 0:
             name = parts[i-1]
-            # 转为首字母大写
             return name.replace("-", " ").title()
     return f"Category_{index:03d}"
 
 
 # ============================================================
-# Captcha / WAF 检测
+# WAF / Captcha / 访问限制 检测 (V2.0.2 统一处理)
 # ============================================================
-def detect_captcha(html: str, http_status: int, url: str) -> Optional[CaptchaRequiredError]:
+def detect_waf_block(html: str, http_status: int, url: str,
+                     category: str = "", page_num: int = 0) -> Optional[WafBlockError]:
     """
-    检测是否遇到验证码或WAF人工验证。
-    返回 CaptchaRequiredError 或 None（表示无验证码）。
+    检测是否遇到 WAF、验证码或访问限制。
+    HTTP 403, 429, 511 统一视为阻断，无论响应正文内容。
+    同时检测响应正文中的验证码特征。
     """
+    # --- 无条件阻断的 HTTP 状态码 ---
+    if http_status in (403, 429, 511):
+        block_names = {403: "HTTP_403_FORBIDDEN", 429: "HTTP_429_RATE_LIMIT", 511: "HTTP_511_WAF"}
+        block_type = block_names.get(http_status, f"HTTP_{http_status}")
+        evidence_parts = [f"HTTP {http_status}"]
+        if html:
+            html_lower = html.lower()
+            # 收集额外的上下文信息
+            if "captcha" in html_lower:
+                evidence_parts.append("captcha keyword in body")
+            if "waf" in html_lower:
+                evidence_parts.append("WAF keyword in body")
+            if "blocked" in html_lower:
+                evidence_parts.append("blocked keyword in body")
+            if "aws" in html_lower:
+                evidence_parts.append("AWS keyword in body")
+        return WafBlockError(
+            http_status, category, page_num, url,
+            block_type, "; ".join(evidence_parts)
+        )
+
     if not html:
         return None
 
     html_lower = html.lower()
-    html_upper = html.upper()
 
-    # --- 1. HTTP 511 (AWS WAF Network Authentication) ---
-    if http_status == 511:
-        if "aws-waf-token" in html_lower or "awswaf" in html_lower or "captcha" in html_lower:
-            return CaptchaRequiredError(
-                511, "", 0, url, "AWS_WAF_511",
-                "HTTP 511 + AWS WAF token/captcha markers found"
-            )
-
-    # --- 2. AWS WAF captcha specific markers ---
+    # --- HTML 正文中的 WAF/验证码特征 ---
     aws_waf_markers = [
         "aws-waf-token", "awswaf-captcha", "captcha-sdk.awswaf",
         "awsWafCookieDomainList", "AwsWafCaptcha",
     ]
     aws_hits = [m for m in aws_waf_markers if m.lower() in html_lower]
     if aws_hits:
-        return CaptchaRequiredError(
-            http_status, "", 0, url, "AWS_WAF_CAPTCHA",
-            f"AWS WAF markers: {', '.join(aws_hits[:3])}"
+        return WafBlockError(
+            http_status, category, page_num, url, "AWS_WAF_MARKERS",
+            f"AWS WAF markers found: {', '.join(aws_hits[:3])}"
         )
 
-    # --- 3. HTTP 403 with captcha page ---
-    if http_status == 403:
-        has_captcha_indicators = any(m in html_lower for m in [
-            "captcha", "waf", "challenge", "blocked",
-            "verify you are human", "are you a human",
-        ])
-        has_product_cards = "data-product-id" in html_lower
-        if has_captcha_indicators and not has_product_cards:
-            return CaptchaRequiredError(
-                403, "", 0, url, "WAF_403_CHALLENGE",
-                "HTTP 403 with captcha/challenge markers, no product cards"
-            )
-
-    # --- 4. CAPTCHA page markers in HTML (even with HTTP 200) ---
-    captcha_title_markers = [
-        "<title>emag captcha</title>",
-        "<title>captcha</title>",
-        "human verification",
-        "access denied",
-        "please verify you are human",
+    # 验证码/人机验证页面特征
+    captcha_markers = [
+        "emag captcha", "captcha", "human verification",
+        "access denied", "please verify you are human",
+        "are you a human", "verify you are human",
+        "unusual traffic", "trafic neobisnuit",
     ]
     has_products = "data-product-id" in html_lower
 
     if not has_products:
-        for marker in captcha_title_markers:
-            if marker.lower() in html_lower:
-                return CaptchaRequiredError(
-                    http_status, "", 0, url, "CAPTCHA_PAGE",
-                    f"Captcha marker '{marker[:60]}' found, no products on page"
-                )
-
-        # Check for eMAG-specific captcha page
-        if "emag captcha" in html_lower or ("captcha" in html_lower and "emag" in html_lower):
-            return CaptchaRequiredError(
-                http_status, "", 0, url, "EMAG_CAPTCHA",
-                "eMAG captcha page detected, no products present"
+        captcha_hits = [m for m in captcha_markers if m in html_lower]
+        if captcha_hits:
+            return WafBlockError(
+                http_status, category, page_num, url, "CAPTCHA_PAGE",
+                f"Captcha markers found: {', '.join(captcha_hits[:3])}"
             )
 
     return None
+
+
+# 保持旧函数名兼容
+detect_captcha = detect_waf_block
 
 
 # ============================================================
@@ -205,8 +221,7 @@ def detect_captcha(html: str, http_status: int, url: str) -> Optional[CaptchaReq
 def get_product_key(product: dict) -> str:
     """
     统一产品唯一键函数。
-    优先级: pnk > product_id > 规范化product_url > 图片URL哈希
-    必须在所有去重、图片映射、唯一商品统计中统一使用。
+    优先级: pnk > product_id > 规范化product_url > 图片URL哈希 > 标题哈希
     """
     pnk = (product.get("pnk") or "").strip()
     if pnk:
@@ -218,7 +233,6 @@ def get_product_key(product: dict) -> str:
 
     url = (product.get("product_url") or "").strip()
     if url:
-        # 规范化: 去掉尾部斜杠和查询参数
         normalized = url.split("?")[0].rstrip("/").lower()
         return f"url:{hashlib.md5(normalized.encode()).hexdigest()[:12]}"
 
@@ -226,7 +240,6 @@ def get_product_key(product: dict) -> str:
     if img_url:
         return f"img:{hashlib.md5(img_url.encode()).hexdigest()[:12]}"
 
-    # 最终兜底: 标题哈希
     title = (product.get("title") or "").strip()
     return f"title:{hashlib.md5(title.encode()).hexdigest()[:12]}"
 
@@ -282,7 +295,6 @@ def parse_romanian_price(text: str) -> Optional[float]:
     if not text:
         return None
 
-    # "1.234,56" format (thousands dot, decimal comma)
     if re.match(r'^(\d{1,3}(\.\d{3})+),\d{1,2}$', text):
         text = text.replace('.', '').replace(',', '.')
     elif re.match(r'^\d+,\d{1,2}$', text):
@@ -290,7 +302,6 @@ def parse_romanian_price(text: str) -> Optional[float]:
     elif re.match(r'^\d+$', text):
         pass
     else:
-        # Last resort: strip dots and treat comma as decimal
         cleaned = text.replace('.', '').replace(',', '.').strip()
         try:
             return round(float(cleaned), 2)
@@ -325,21 +336,9 @@ def sanitize_filename(name: str) -> str:
     return name.strip()
 
 
-def normalize_url(base_url: str, path: str) -> str:
-    """将相对路径转为绝对 URL"""
-    if path.startswith("http"):
-        return path
-    if path.startswith("//"):
-        return "https:" + path
-    if path.startswith("/"):
-        match = re.match(r'(https?://[^/]+)', base_url)
-        if match:
-            return match.group(1) + path
-    return path
-
-
 def write_errors_csv(filepath: str, error_data: dict, write_header: bool = False) -> None:
-    """追加写入错误记录（线程安全）"""
+    """追加写入错误记录"""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
     file_exists = os.path.exists(filepath) and os.path.getsize(filepath) > 0
     with open(filepath, "a", encoding="utf-8-sig", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(error_data.keys()))
@@ -348,21 +347,33 @@ def write_errors_csv(filepath: str, error_data: dict, write_header: bool = False
         writer.writerow(error_data)
 
 
+def ensure_errors_csv(filepath: str) -> None:
+    """确保 errors.csv 存在（至少包含表头）"""
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+        headers = ["时间", "类目", "页码", "URL", "错误类型", "HTTP状态码", "重试次数", "错误详情"]
+        with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+
+
 def get_version() -> str:
     """读取版本号"""
     version_file = os.path.join(os.path.dirname(__file__), "VERSION")
     if os.path.exists(version_file):
         with open(version_file, "r") as f:
             return f.read().strip()
-    return "2.0.1"
+    return "2.0.2"
 
 
 def write_atomic_json(filepath: str, data) -> None:
-    """
-    原子写入JSON文件: 先写 .tmp, 成功后 os.replace 为正式文件。
-    避免程序异常时留下半个JSON文件。
-    """
+    """原子写入JSON文件: 先写 .tmp, 成功后 os.replace"""
     tmp_path = filepath + ".tmp"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_path, filepath)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, filepath)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise

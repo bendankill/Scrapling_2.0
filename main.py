@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-eMAG 商品列表爬虫 V2.0.1
+eMAG 商品列表爬虫 V2.0.2
 基于 Scrapling 纯 HTTP Fetcher, 支持多类目并发抓取
 
 使用方法:
@@ -22,14 +22,14 @@ import sys
 
 from utils import (
     EXIT_SUCCESS, EXIT_CONFIG_ERROR, EXIT_NETWORK_ERROR,
-    EXIT_CAPTCHA, EXIT_INTERRUPT, CaptchaRequiredError,
+    EXIT_CAPTCHA, EXIT_INTERRUPT, WafBlockError,
 )
 
 
 def parse_args() -> argparse.Namespace:
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
-        description="eMAG 商品列表爬虫 V2.0.1 — 纯 HTTP 模式",
+        description="eMAG 商品列表爬虫 V2.0.2 — 纯 HTTP 模式",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -55,13 +55,13 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--no-images", action="store_true", help="不下载商品主图")
     parser.add_argument("--category-workers", type=int, default=2, help="类目并发数 (默认: 2, 必须 > 0)")
-    parser.add_argument("--page-workers", type=int, default=4, help="页面并发数 (默认: 4, 必须 > 0)")
+    parser.add_argument("--page-workers", type=int, default=3, help="页面并发数 (默认: 3, 必须 > 0)")
     parser.add_argument("--image-workers", type=int, default=8, help="图片下载并发数 (默认: 8, 必须 > 0)")
     parser.add_argument("--max-in-flight", type=int, default=16, help="全局最大并发请求数 (默认: 16, 必须 > 0)")
     parser.add_argument("--output", default=None, help="输出目录 (默认: output/YYYYMMDD_HHMMSS)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                       help="日志级别 (默认: INFO)")
-    parser.add_argument("--version", action="version", version="eMAG Crawler V2.0.1")
+    parser.add_argument("--version", action="version", version="eMAG Crawler V2.0.2")
 
     return parser.parse_args()
 
@@ -77,7 +77,7 @@ def print_startup_info(categories: list[dict], max_pages: int | None,
                        download_images: bool, args: argparse.Namespace, output_dir: str):
     """打印启动信息"""
     print("=" * 60)
-    print("  eMAG 商品列表爬虫 V2.0.1 (纯 HTTP)")
+    print("  eMAG 商品列表爬虫 V2.0.2 (纯 HTTP)")
     print("=" * 60)
     print(f"  已启用类目数量: {len(categories)}")
     for cat in categories:
@@ -149,15 +149,15 @@ def main() -> int:
     )
 
     # --- 执行抓取 ---
-    captcha_detected = False
+    waf_detected = False
     keyboard_interrupt = False
     top_level_error = False
 
     try:
         crawler.crawl_all_categories(categories, max_pages=max_pages)
-    except CaptchaRequiredError as e:
-        captcha_detected = True
-        logger.error(f"验证码终止: {e}")
+    except WafBlockError as e:
+        waf_detected = True
+        logger.error(f"WAF阻断: {e}")
     except KeyboardInterrupt:
         keyboard_interrupt = True
         logger.warning("用户中断抓取")
@@ -172,11 +172,11 @@ def main() -> int:
 
     # --- 判断退出码 ---
     tot = summary.get("totals", {})
-    is_captcha = summary.get("status") == "captcha_required" or captcha_detected
+    is_waf_block = summary.get("status") in ("waf_blocked", "captcha_required") or waf_detected or crawler._waf_stop.is_set()
 
     if keyboard_interrupt:
         exit_code = EXIT_INTERRUPT
-    elif is_captcha:
+    elif is_waf_block:
         exit_code = EXIT_CAPTCHA
     elif top_level_error:
         exit_code = EXIT_NETWORK_ERROR
@@ -199,7 +199,8 @@ def main() -> int:
     print(f"  总耗时: {summary.get('elapsed_seconds', 0):.1f}s")
 
     print(f"\n  输出文件:")
-    for fname in ["products.xlsx", "products.csv", "products.json", "run_summary.json", "errors.csv"]:
+    for fname in ["products.xlsx", "products.csv", "products.json", "run_summary.json", "errors.csv",
+                   *([os.path.join("diagnostics", "captcha_diagnostic.json")] if is_waf_block else [])]:
         fpath = os.path.join(output_dir, fname)
         if os.path.exists(fpath):
             size_kb = os.path.getsize(fpath) / 1024
