@@ -1,0 +1,4 @@
+# eMAG category URLs, one per line.
+# Lines starting with # are comments. Empty lines are ignored.
+# Only https://www.emag.ro/.../c and https://emag.ro/.../c paths are valid.
+https://www.emag.ro/mouse/c

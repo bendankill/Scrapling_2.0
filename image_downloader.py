@@ -5,76 +5,46 @@ import os
 import hashlib
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from threading import Semaphore
+from threading import Semaphore, Lock
 from typing import Optional
 
 import httpx
 from models import ProductItem
-from utils import sanitize_filename
+from utils import sanitize_filename, get_product_key
 
 logger = logging.getLogger("emag_crawler.images")
 
-# 禁止下载的 URL 模式
 BLOCKED_PATTERNS = [
-    "data:image",
-    "placeholder",
-    "loading",
-    "logo",
-    "pixel",
-    "tracking",
-    ".svg",  # SVG 可能是 logo
-    "blank",
-    "spacer",
-    "1x1",
-    "base64",
+    "data:image", "placeholder", "loading", "logo",
+    "pixel", "tracking", ".svg", "blank", "spacer", "1x1", "base64",
 ]
-
-# 有效图片大小下限（字节）
-MIN_IMAGE_SIZE = 1024  # 1KB
-
-# 有效 Content-Type
-VALID_CONTENT_TYPES = {
-    "image/jpeg",
-    "image/jpg",
-    "image/png",
-    "image/webp",
-    "image/avif",
-}
-
-# 允许的扩展名
+MIN_IMAGE_SIZE = 1024
+VALID_CONTENT_TYPES = {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/avif"}
 VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".avif"}
-
-# 魔数签名 -> 扩展名映射
 MAGIC_TO_EXT = {
-    b'\xff\xd8\xff': '.jpg',       # JPEG
-    b'\x89PNG': '.png',             # PNG
-    b'RIFF': '.webp',               # WebP (RIFF....WEBP)
-    b'\x00\x00\x00\x1cftypavif': '.avif',  # AVIF
+    b'\xff\xd8\xff': '.jpg',
+    b'\x89PNG': '.png',
+    b'RIFF': '.webp',
+    b'\x00\x00\x00\x1cftypavif': '.avif',
 }
 
 
 class ImageDownloader:
     """图片下载器，支持并发控制和缓存检查"""
 
-    def __init__(
-        self,
-        output_dir: str,
-        max_workers: int = 8,
-        max_in_flight: int = 16,
-        timeout: int = 30,
-    ):
+    def __init__(self, output_dir: str, max_workers: int = 8,
+                 max_in_flight: int = 16, global_semaphore: Optional[Semaphore] = None,
+                 timeout: int = 30):
         self.output_dir = os.path.join(output_dir, "images")
         os.makedirs(self.output_dir, exist_ok=True)
-
         self.max_workers = max_workers
-        self.semaphore = Semaphore(max_in_flight)
+        self.semaphore = global_semaphore or Semaphore(max_in_flight)
         self.timeout = timeout
 
-        # 已下载的 URL 缓存（避免重复下载）
+        # 已经下载的图片URL缓存
         self._downloaded_urls: set = set()
-        self._downloaded_hashes: set = set()
+        self._url_lock = Lock()
 
-        # HTTP 客户端（复用连接）
         self._client = httpx.Client(
             timeout=httpx.Timeout(timeout),
             follow_redirects=False,
@@ -87,95 +57,83 @@ class ImageDownloader:
         self.success_count = 0
         self.fail_count = 0
         self.errors: list[dict] = []
+        self._errors_lock = Lock()
 
-    def download_for_product(self, product: ProductItem) -> Optional[str]:
-        """为单个商品下载主图，返回本地路径"""
-        if not product.main_image_url:
-            return None
-
-        url = product.main_image_url
-
-        # 检查是否应该下载
-        if not self._should_download(url):
-            return None
-
-        # 检查是否已下载过
-        if url in self._downloaded_urls:
-            return self._get_local_path(url)
-
-        # 生成文件名
-        filename = self._generate_filename(product, url)
-
-        with self.semaphore:
-            local_path = self._do_download(url, filename)
-
-        if local_path:
-            self._downloaded_urls.add(url)
-            self.success_count += 1
-        else:
-            self.fail_count += 1
-
-        return local_path
-
-    def download_batch(self, products: list[ProductItem]) -> dict:
-        """批量下载图片，返回 {product_id: local_path}"""
-        result = {}
-        unique_urls = {}
-
-        # 先去重：按 URL 去重
+    def download_batch(self, products: list[dict]) -> dict[str, str]:
+        """
+        批量下载图片。
+        products: list of dict (每个dict需包含 pnk, product_id, product_url, main_image_url)
+        返回: {product_key: local_path}
+        """
+        # 按 product_key 去重: 每个唯一商品只下载一次
+        unique_products: dict[str, dict] = {}
         for p in products:
-            if p.main_image_url and p.main_image_url not in unique_urls:
-                unique_urls[p.main_image_url] = []
+            key = get_product_key(p)
+            img_url = (p.get("main_image_url") or "").strip()
+            if key and key not in unique_products and img_url:
+                unique_products[key] = p
 
-        # 使用线程池并发下载
+        logger.info(f"准备下载 {len(unique_products)} 个唯一商品的图片")
+        result: dict[str, str] = {}
+
+        # 先按图片URL再次去重
+        url_to_key: dict[str, str] = {}
+        for key, prod in unique_products.items():
+            url = prod["main_image_url"]
+            if url not in url_to_key:
+                url_to_key[url] = key
+
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {}
-            for url in unique_urls:
-                future = executor.submit(
-                    self._download_single, url
-                )
-                futures[future] = url
+            for url, key in url_to_key.items():
+                prod = unique_products[key]
+                future = executor.submit(self._download_single, url, prod)
+                futures[future] = (url, key)
 
             for future in as_completed(futures):
-                url = futures[future]
+                url, key = futures[future]
                 try:
                     local_path = future.result()
                     if local_path:
-                        unique_urls[url] = local_path
-                        self._downloaded_urls.add(url)
+                        result[key] = local_path
                         self.success_count += 1
                     else:
                         self.fail_count += 1
                 except Exception as e:
                     self.fail_count += 1
-                    self.errors.append({
-                        "url": url,
-                        "error_type": type(e).__name__,
-                        "error_detail": str(e)[:500],
-                    })
+                    with self._errors_lock:
+                        self.errors.append({
+                            "url": url,
+                            "error_type": type(e).__name__,
+                            "error_detail": str(e)[:500],
+                        })
                     logger.warning(f"图片下载失败 [{url[:80]}]: {e}")
-
-        # 将下载路径映射回商品
-        for p in products:
-            if p.main_image_url and p.main_image_url in unique_urls:
-                result[p.product_id or p.pnk] = unique_urls[p.main_image_url]
 
         return result
 
-    def _download_single(self, url: str) -> Optional[str]:
-        """下载单个 URL 的图片"""
-        try:
-            filename = self._generate_filename_from_url(url)
-            return self._do_download(url, filename)
-        except Exception as e:
-            logger.debug(f"下载失败 [{url[:80]}]: {e}")
+    def _download_single(self, url: str, product: dict) -> Optional[str]:
+        """下载单个商品的主图"""
+        if not self._should_download(url):
             return None
+
+        # 检查是否已下载
+        with self._url_lock:
+            if url in self._downloaded_urls:
+                return self._get_local_path(url)
+
+        with self.semaphore:
+            filename = self._generate_filename(product, url)
+            local_path = self._do_download(url, filename)
+
+        if local_path:
+            with self._url_lock:
+                self._downloaded_urls.add(url)
+        return local_path
 
     def _do_download(self, url: str, filename: str) -> Optional[str]:
         """执行实际下载"""
         local_path = os.path.join(self.output_dir, filename)
 
-        # 检查文件是否已存在
         if os.path.exists(local_path) and os.path.getsize(local_path) > MIN_IMAGE_SIZE:
             return local_path
 
@@ -184,16 +142,14 @@ class ImageDownloader:
             if resp.status_code != 200:
                 raise Exception(f"HTTP {resp.status_code}")
 
-            # 检查大小
             content = resp.content
             if len(content) < MIN_IMAGE_SIZE:
                 raise Exception(f"图片过小: {len(content)} 字节")
 
-            # 检查是否为 HTML 错误页面
             if content[:100].strip().startswith(b"<!") or content[:100].strip().startswith(b"<html"):
-                raise Exception("响应内容为 HTML 页面，非图片")
+                raise Exception("响应为 HTML 页面，非图片")
 
-            # 根据魔数检测实际图片格式
+            # 魔数检测
             detected_ext = None
             for magic, ext in MAGIC_TO_EXT.items():
                 if content[:len(magic)] == magic:
@@ -201,26 +157,18 @@ class ImageDownloader:
                     break
 
             if detected_ext is None:
-                # 尝试通过 content-type 检测
                 content_type = resp.headers.get("content-type", "").split(";")[0].strip()
-                if content_type in VALID_CONTENT_TYPES:
-                    ext_map = {
-                        "image/jpeg": ".jpg", "image/jpg": ".jpg",
-                        "image/png": ".png", "image/webp": ".webp",
-                        "image/avif": ".avif",
-                    }
-                    detected_ext = ext_map.get(content_type, ".jpg")
-                else:
-                    raise Exception(f"无法识别图片格式")
+                ext_map = {"image/jpeg": ".jpg", "image/jpg": ".jpg",
+                          "image/png": ".png", "image/webp": ".webp", "image/avif": ".avif"}
+                detected_ext = ext_map.get(content_type)
+                if detected_ext is None:
+                    raise Exception(f"无法识别图片格式: content-type={content_type}")
 
-            # 使用检测到的扩展名
             filename = filename.rsplit(".", 1)[0] + detected_ext
             local_path = os.path.join(self.output_dir, filename)
 
-            # 写入文件
             with open(local_path, "wb") as f:
                 f.write(content)
-
             return local_path
 
         except Exception as e:
@@ -228,7 +176,6 @@ class ImageDownloader:
             return None
 
     def _should_download(self, url: str) -> bool:
-        """检查 URL 是否应该下载"""
         if not url:
             return False
         url_lower = url.lower()
@@ -237,40 +184,28 @@ class ImageDownloader:
                 return False
         return True
 
-    def _generate_filename(self, product: ProductItem, url: str) -> str:
-        """生成稳定的文件名"""
-        # 优先使用 PNK
-        base = product.pnk or product.product_id or hashlib.md5(url.encode()).hexdigest()[:12]
+    def _generate_filename(self, product: dict, url: str) -> str:
+        pnk = (product.get("pnk") or "").strip()
+        pid = (product.get("product_id") or "").strip()
+        base = pnk or pid or hashlib.md5(url.encode()).hexdigest()[:12]
         base = sanitize_filename(base)
         ext = os.path.splitext(url.split("?")[0])[1]
         if ext.lower() not in VALID_EXTENSIONS:
             ext = ".jpg"
         return f"{base}{ext}"
 
-    def _generate_filename_from_url(self, url: str) -> str:
-        """从 URL 生成文件名"""
-        url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
-        ext = os.path.splitext(url.split("?")[0])[1]
-        if ext.lower() not in VALID_EXTENSIONS:
-            ext = ".jpg"
-        return f"{url_hash}{ext}"
-
     def _get_local_path(self, url: str) -> Optional[str]:
-        """根据 URL 获取已有的本地路径"""
-        filename = self._generate_filename_from_url(url)
-        local_path = os.path.join(self.output_dir, filename)
-        if os.path.exists(local_path):
-            return local_path
+        for fname in os.listdir(self.output_dir):
+            fpath = os.path.join(self.output_dir, fname)
+            if os.path.isfile(fpath) and os.path.getsize(fpath) > MIN_IMAGE_SIZE:
+                # Use a hash to check if file matches URL
+                if hashlib.md5(url.encode()).hexdigest()[:12] in fname:
+                    return fpath
         return None
 
     def close(self):
-        """关闭 HTTP 客户端"""
         self._client.close()
 
     def get_stats(self) -> dict:
-        """获取下载统计"""
-        return {
-            "success": self.success_count,
-            "failed": self.fail_count,
-            "errors": self.errors,
-        }
+        with self._errors_lock:
+            return {"success": self.success_count, "failed": self.fail_count, "errors": list(self.errors)}

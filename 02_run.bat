@@ -1,35 +1,32 @@
 @echo off
-chcp 65001 >nul
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
 setlocal enabledelayedexpansion
 
 cd /d "%~dp0"
 
-:: 检查虚拟环境
 if not exist ".venv\Scripts\python.exe" (
-    echo [错误] 虚拟环境不存在！
-    echo 请先双击运行 01_install.bat 安装环境
+    echo [ERROR] Virtual environment not found!
+    echo Please run 01_install.bat first.
     pause
     exit /b 1
 )
 
-:: 激活虚拟环境
-call .venv\Scripts\activate.bat
-
 :menu
 cls
 echo ============================================
-echo   eMAG 爬虫 V2.0 — 运行菜单
+echo   eMAG Crawler V2.0.1 - Run Menu
 echo ============================================
 echo.
-echo   1. 测试抓取 1 页，不下载图片
-echo   2. 测试抓取 2 页，不下载图片
-echo   3. 抓取指定页数，下载主图
-echo   4. 抓取指定页数，不下载图片
-echo   5. 抓取全部页面并下载主图（需要二次确认）
-echo   6. 打开类目配置文件
-echo   7. 退出
+echo   1. Test 1 page, no images
+echo   2. Test 2 pages, no images
+echo   3. Crawl N pages, with images
+echo   4. Crawl N pages, no images
+echo   5. Crawl all pages, with images (confirmation required)
+echo   6. Open config\categories.txt
+echo   7. Exit
 echo.
-set /p choice=请输入选项 (1-7):
+set /p choice="Enter option (1-7): "
 
 if "%choice%"=="1" goto test1
 if "%choice%"=="2" goto test2
@@ -38,81 +35,106 @@ if "%choice%"=="4" goto pages_noimg
 if "%choice%"=="5" goto allpages
 if "%choice%"=="6" goto editconfig
 if "%choice%"=="7" goto end
-echo 无效选项，请重试
+echo Invalid option
 pause
 goto menu
 
 :test1
 echo.
-echo [执行] 测试抓取 1 页，不下载图片...
-.venv\Scripts\python.exe main.py --pages 1 --no-images
-if %ERRORLEVEL% NEQ 0 (
-    echo [注意] 程序返回错误码: %ERRORLEVEL%
-)
-echo.
+echo [RUN] 1 page, no images...
+".venv\Scripts\python.exe" main.py --pages 1 --no-images
+call :check_result
 pause
 goto menu
 
 :test2
 echo.
-echo [执行] 测试抓取 2 页，不下载图片...
-.venv\Scripts\python.exe main.py --pages 2 --no-images
-if %ERRORLEVEL% NEQ 0 (
-    echo [注意] 程序返回错误码: %ERRORLEVEL%
-)
-echo.
+echo [RUN] 2 pages, no images...
+".venv\Scripts\python.exe" main.py --pages 2 --no-images
+call :check_result
 pause
 goto menu
 
 :pages_img
 echo.
-set /p num=请输入每个类目最大页数:
-echo [执行] 抓取 %num% 页，下载主图...
-.venv\Scripts\python.exe main.py --pages %num%
-if %ERRORLEVEL% NEQ 0 (
-    echo [注意] 程序返回错误码: %ERRORLEVEL%
+set "num="
+set /p num="Pages per category: "
+:: Validate: must be a positive integer
+set "valid=1"
+if "%num%"=="" set "valid=0"
+for /f "delims=0123456789" %%d in ("%num%") do set "valid=0"
+if "%num%"=="0" set "valid=0"
+if "%valid%"=="0" (
+    echo [ERROR] Please enter a positive integer (1, 2, 3, ...)
+    pause
+    goto menu
 )
-echo.
+echo [RUN] %num% pages, with images...
+".venv\Scripts\python.exe" main.py --pages %num%
+call :check_result
 pause
 goto menu
 
 :pages_noimg
 echo.
-set /p num=请输入每个类目最大页数:
-echo [执行] 抓取 %num% 页，不下载图片...
-.venv\Scripts\python.exe main.py --pages %num% --no-images
-if %ERRORLEVEL% NEQ 0 (
-    echo [注意] 程序返回错误码: %ERRORLEVEL%
+set "num="
+set /p num="Pages per category: "
+set "valid=1"
+if "%num%"=="" set "valid=0"
+for /f "delims=0123456789" %%d in ("%num%") do set "valid=0"
+if "%num%"=="0" set "valid=0"
+if "%valid%"=="0" (
+    echo [ERROR] Please enter a positive integer (1, 2, 3, ...)
+    pause
+    goto menu
 )
-echo.
+echo [RUN] %num% pages, no images...
+".venv\Scripts\python.exe" main.py --pages %num% --no-images
+call :check_result
 pause
 goto menu
 
 :allpages
 echo.
-echo [警告] 此操作将抓取全部页面并下载主图，可能耗时很长！
-set /p confirm=确认执行？(输入 yes 继续):
+echo [WARNING] This will crawl ALL pages and download images. It may take a long time!
+set /p confirm="Type 'yes' to confirm: "
 if /i not "%confirm%"=="yes" (
-    echo 已取消
+    echo Cancelled
     pause
     goto menu
 )
-echo [执行] 抓取全部页面并下载主图...
-.venv\Scripts\python.exe main.py --all-pages
-if %ERRORLEVEL% NEQ 0 (
-    echo [注意] 程序返回错误码: %ERRORLEVEL%
-)
-echo.
+echo [RUN] All pages, with images...
+".venv\Scripts\python.exe" main.py --all-pages
+call :check_result
 pause
 goto menu
 
 :editconfig
 echo.
-echo 正在打开类目配置文件...
-start notepad config\categories.json
+echo Opening config\categories.txt...
+if exist "config\categories.txt" (
+    start notepad "config\categories.txt"
+) else (
+    echo [ERROR] config\categories.txt not found
+)
 pause
 goto menu
 
+:check_result
+set "EC=%ERRORLEVEL%"
+if %EC% EQU 0 (
+    echo [OK] Completed successfully (exit code 0)
+) else if %EC% EQU 3 (
+    echo [CAPTCHA] Website verification required - see captcha_diagnostic.json
+    echo   Open the URL in a normal browser, complete the verification, then run again.
+    echo   If the issue persists, pure HTTP access may not be possible right now.
+) else if %EC% EQU 130 (
+    echo [STOPPED] Interrupted by user (Ctrl+C)
+) else (
+    echo [FAILED] Exit code: %EC%
+)
+goto :eof
+
 :end
-echo 再见！
+echo Goodbye!
 exit /b 0

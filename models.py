@@ -73,10 +73,13 @@ class ProductItem:
     # 额外字段（保留原始数据中未明确映射的字段）
     extra: dict = field(default_factory=dict)
 
-    def to_dict(self) -> dict:
-        """转为字典，用于导出"""
+    def to_dict(self, stringify_extra: bool = False) -> dict:
+        """转为字典。stringify_extra=True 时将 extra 转为 JSON 字符串 (用于 CSV/XLSX)"""
         d = asdict(self)
-        d["extra"] = json.dumps(self.extra, ensure_ascii=False) if self.extra else ""
+        if stringify_extra and self.extra:
+            d["extra"] = json.dumps(self.extra, ensure_ascii=False)
+        elif not stringify_extra and not self.extra:
+            d.pop("extra", None)
         return d
 
     @staticmethod
