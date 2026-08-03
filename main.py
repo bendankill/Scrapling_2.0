@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-eMAG 商品列表爬虫 V2.0.2
+eMAG 商品列表爬虫 V2.0.3
 基于 Scrapling 纯 HTTP Fetcher, 支持多类目并发抓取
 
 使用方法:
@@ -29,7 +29,7 @@ from utils import (
 def parse_args() -> argparse.Namespace:
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
-        description="eMAG 商品列表爬虫 V2.0.2 — 纯 HTTP 模式",
+        description="eMAG 商品列表爬虫 V2.0.3 — 纯 HTTP 模式",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
@@ -51,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     page_group.add_argument("--pages", type=int, default=1,
                           help="每个类目最大抓取页数 (默认: 1, 必须 > 0)")
     page_group.add_argument("--all-pages", action="store_true",
-                          help="抓取每个类目的全部页面 (与 --pages 互斥)")
+                          help="抓取每个类目最多20页 (与 --pages 互斥)")
 
     parser.add_argument("--no-images", action="store_true", help="不下载商品主图")
     parser.add_argument("--category-workers", type=int, default=2, help="类目并发数 (默认: 2, 必须 > 0)")
@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default=None, help="输出目录 (默认: output/YYYYMMDD_HHMMSS)")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                       help="日志级别 (默认: INFO)")
-    parser.add_argument("--version", action="version", version="eMAG Crawler V2.0.2")
+    parser.add_argument("--version", action="version", version="eMAG Crawler V2.0.3")
 
     return parser.parse_args()
 
@@ -77,12 +77,12 @@ def print_startup_info(categories: list[dict], max_pages: int | None,
                        download_images: bool, args: argparse.Namespace, output_dir: str):
     """打印启动信息"""
     print("=" * 60)
-    print("  eMAG 商品列表爬虫 V2.0.2 (纯 HTTP)")
+    print("  eMAG 商品列表爬虫 V2.0.3 (纯 HTTP)")
     print("=" * 60)
     print(f"  已启用类目数量: {len(categories)}")
     for cat in categories:
         print(f"    - {cat['name']}: {cat['url']}")
-    print(f"  抓取页数模式: {'全部页面' if max_pages is None else f'最多 {max_pages} 页/类目'}")
+    print(f"  抓取页数模式: {'最多20页/类目' if max_pages is None else f'最多 {max_pages} 页/类目'}")
     print(f"  下载商品主图: {'否' if not download_images else '是'}")
     print(f"  并发配置: 类目={args.category_workers}, 页面={args.page_workers}, 图片={args.image_workers}, 全局={args.max_in_flight}")
     print(f"  输出目录: {output_dir}")

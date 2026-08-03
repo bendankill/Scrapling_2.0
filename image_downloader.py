@@ -1,5 +1,5 @@
 """
-图片下载模块 V2.0.2: 下载商品主图, 错误记录, 同URL多商品回填
+图片下载模块 V2.0.3: 下载主图, 结构化错误记录, 同URL多商品回填
 """
 import os
 import hashlib
@@ -29,8 +29,20 @@ MAGIC_TO_EXT = {
 }
 
 
+class ImageDownloadError(Exception):
+    """图片下载失败, 携带结构化错误信息"""
+    def __init__(self, image_url: str, error_type: str, http_status: int = 0,
+                 detail: str = "", product_keys: list = None):
+        self.image_url = image_url
+        self.error_type = error_type
+        self.http_status = http_status
+        self.detail = detail
+        self.product_keys = product_keys or []
+        super().__init__(f"[{error_type}] {image_url}: {detail}")
+
+
 class ImageDownloader:
-    """图片下载器, 支持并发控制、缓存、同URL多商品回填"""
+    """图片下载器 V2.0.3"""
 
     def __init__(self, output_dir: str, max_workers: int = 8,
                  max_in_flight: int = 16, global_semaphore: Optional[Semaphore] = None,
@@ -43,14 +55,12 @@ class ImageDownloader:
 
         self._downloaded_urls: set = set()
         self._url_lock = Lock()
-
-        # URL → local_path 缓存 (同URL多商品共享)
         self._url_path_cache: dict[str, str] = {}
         self._cache_lock = Lock()
 
         self._client = httpx.Client(
             timeout=httpx.Timeout(timeout),
-            follow_redirects=True,  # 跟随重定向
+            follow_redirects=True,
             max_redirects=5,
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -65,10 +75,9 @@ class ImageDownloader:
 
     def download_batch(self, products: list[dict]) -> dict[str, str]:
         """
-        批量下载图片。
-        返回: {product_key: local_path} (同URL多商品均回填)
+        批量下载图片。仅下载不抛出, 错误记录到 self.errors。
+        返回: {product_key: local_path}
         """
-        # 按 product_key 去重
         unique_products: dict[str, dict] = {}
         for p in products:
             key = get_product_key(p)
@@ -76,7 +85,6 @@ class ImageDownloader:
             if key and key not in unique_products and img_url:
                 unique_products[key] = p
 
-        # 按图片URL去重: url → [product_keys]
         url_to_keys: dict[str, list[str]] = {}
         for key, prod in unique_products.items():
             url = prod["main_image_url"]
@@ -84,58 +92,76 @@ class ImageDownloader:
                 url_to_keys[url] = []
             url_to_keys[url].append(key)
 
-        logger.info(f"准备下载 {len(url_to_keys)} 个唯一URL的图片 (对应 {len(unique_products)} 个商品)")
+        logger.info(f"准备下载 {len(url_to_keys)} 个唯一URL (对应 {len(unique_products)} 个商品)")
 
-        # 并发下载
         result: dict[str, str] = {}
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {}
-            for url in url_to_keys:
-                future = executor.submit(self._download_url, url)
-                futures[future] = url
+            for url, keys in url_to_keys.items():
+                # 传入一个商品用于获取类目/页码信息
+                sample = unique_products[keys[0]]
+                future = executor.submit(self._download_single, url, sample, keys)
+                futures[future] = (url, keys)
 
             for future in as_completed(futures):
-                url = futures[future]
+                url, keys = futures[future]
                 try:
                     local_path = future.result()
                     if local_path:
-                        # 回填所有使用此URL的商品
-                        for key in url_to_keys[url]:
+                        for key in keys:
                             result[key] = local_path
                         self.success_count += 1
                         with self._cache_lock:
                             self._url_path_cache[url] = local_path
                     else:
                         self.fail_count += 1
+                except ImageDownloadError as e:
+                    self.fail_count += 1
+                    with self._errors_lock:
+                        self.errors.append({
+                            "image_url": e.image_url,
+                            "error_type": e.error_type,
+                            "http_status": e.http_status,
+                            "error_detail": e.detail,
+                            "product_key": ", ".join(e.product_keys) if e.product_keys else "",
+                            "category": sample.get("category_name", ""),
+                            "page": sample.get("page_number", 0),
+                            "url": e.image_url,
+                        })
+                    logger.warning(f"图片下载失败 [{url[:80]}]: {e}")
                 except Exception as e:
                     self.fail_count += 1
                     with self._errors_lock:
                         self.errors.append({
-                            "url": url,
+                            "image_url": url,
                             "error_type": type(e).__name__,
+                            "http_status": 0,
                             "error_detail": str(e)[:500],
+                            "product_key": ", ".join(keys) if keys else "",
+                            "category": "",
+                            "page": 0,
+                            "url": url,
                         })
                     logger.warning(f"图片下载失败 [{url[:80]}]: {e}")
 
         return result
 
-    def _download_url(self, url: str) -> Optional[str]:
-        """下载单个图片URL"""
+    def _download_single(self, url: str, product: dict, product_keys: list) -> Optional[str]:
+        """下载单个图片URL, 失败抛出 ImageDownloadError"""
         if not self._should_download(url):
-            return None
+            raise ImageDownloadError(url, "BLOCKED_PATTERN", detail="URL matches blocked pattern",
+                                    product_keys=product_keys)
 
-        # 检查缓存
         with self._cache_lock:
             if url in self._url_path_cache:
                 return self._url_path_cache[url]
 
         with self.semaphore:
-            # 使用 PNK 优先命名
             filename = self._filename_from_url(url)
-            return self._do_download(url, filename)
+            return self._do_download(url, filename, product_keys)
 
-    def _do_download(self, url: str, filename: str) -> Optional[str]:
-        """执行实际下载"""
+    def _do_download(self, url: str, filename: str, product_keys: list) -> Optional[str]:
+        """执行下载, 失败抛出 ImageDownloadError"""
         local_path = os.path.join(self.output_dir, filename)
 
         if os.path.exists(local_path) and os.path.getsize(local_path) > MIN_IMAGE_SIZE:
@@ -143,41 +169,48 @@ class ImageDownloader:
 
         try:
             resp = self._client.get(url)
-            if resp.status_code != 200:
-                raise Exception(f"HTTP {resp.status_code}")
-
-            content = resp.content
-            if len(content) < MIN_IMAGE_SIZE:
-                raise Exception(f"图片过小: {len(content)} 字节")
-
-            if content[:100].strip().startswith(b"<!") or content[:100].strip().startswith(b"<html"):
-                raise Exception("响应为 HTML 页面，非图片")
-
-            # 魔数检测实际格式
-            detected_ext = None
-            for magic, ext in MAGIC_TO_EXT.items():
-                if content[:len(magic)] == magic:
-                    detected_ext = ext
-                    break
-
-            if detected_ext is None:
-                content_type = resp.headers.get("content-type", "").split(";")[0].strip()
-                ext_map = {"image/jpeg": ".jpg", "image/jpg": ".jpg",
-                          "image/png": ".png", "image/webp": ".webp", "image/avif": ".avif"}
-                detected_ext = ext_map.get(content_type)
-                if detected_ext is None:
-                    raise Exception(f"无法识别图片格式: content-type={content_type}")
-
-            filename = filename.rsplit(".", 1)[0] + detected_ext
-            local_path = os.path.join(self.output_dir, filename)
-
-            with open(local_path, "wb") as f:
-                f.write(content)
-            return local_path
-
+        except httpx.TimeoutException:
+            raise ImageDownloadError(url, "TIMEOUT", detail="Request timed out", product_keys=product_keys)
+        except httpx.ConnectError as e:
+            raise ImageDownloadError(url, "CONNECT_ERROR", detail=str(e)[:200], product_keys=product_keys)
         except Exception as e:
-            logger.debug(f"下载失败 [{url[:80]}]: {e}")
-            return None
+            raise ImageDownloadError(url, "NETWORK_ERROR", detail=str(e)[:200], product_keys=product_keys)
+
+        if resp.status_code != 200:
+            raise ImageDownloadError(url, f"HTTP_{resp.status_code}", http_status=resp.status_code,
+                                    detail=f"HTTP {resp.status_code}", product_keys=product_keys)
+
+        content = resp.content
+        if len(content) < MIN_IMAGE_SIZE:
+            raise ImageDownloadError(url, "TOO_SMALL", http_status=200,
+                                    detail=f"Image too small: {len(content)} bytes", product_keys=product_keys)
+
+        if content[:100].strip().startswith(b"<!") or content[:100].strip().startswith(b"<html"):
+            raise ImageDownloadError(url, "HTML_RESPONSE", http_status=200,
+                                    detail="Response is HTML, not an image", product_keys=product_keys)
+
+        detected_ext = None
+        for magic, ext in MAGIC_TO_EXT.items():
+            if content[:len(magic)] == magic:
+                detected_ext = ext
+                break
+
+        if detected_ext is None:
+            content_type = resp.headers.get("content-type", "").split(";")[0].strip()
+            ext_map = {"image/jpeg": ".jpg", "image/jpg": ".jpg",
+                      "image/png": ".png", "image/webp": ".webp", "image/avif": ".avif"}
+            detected_ext = ext_map.get(content_type)
+            if detected_ext is None:
+                raise ImageDownloadError(url, "UNKNOWN_FORMAT", http_status=200,
+                                        detail=f"Cannot identify format: content-type={content_type}",
+                                        product_keys=product_keys)
+
+        filename = filename.rsplit(".", 1)[0] + detected_ext
+        local_path = os.path.join(self.output_dir, filename)
+
+        with open(local_path, "wb") as f:
+            f.write(content)
+        return local_path
 
     def _should_download(self, url: str) -> bool:
         if not url:
@@ -189,7 +222,6 @@ class ImageDownloader:
         return True
 
     def _filename_from_url(self, url: str) -> str:
-        """从 URL 生成文件名 (基于 URL 哈希, 确保一致性)"""
         url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
         ext = os.path.splitext(url.split("?")[0])[1]
         if ext.lower() not in VALID_EXTENSIONS:

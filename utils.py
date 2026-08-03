@@ -336,22 +336,24 @@ def sanitize_filename(name: str) -> str:
     return name.strip()
 
 
-def write_errors_csv(filepath: str, error_data: dict, write_header: bool = False) -> None:
+def write_errors_csv(filepath: str, error_data: dict, write_header: bool = False,
+                     fieldnames: list = None) -> None:
     """追加写入错误记录"""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     file_exists = os.path.exists(filepath) and os.path.getsize(filepath) > 0
+    names = fieldnames or list(error_data.keys())
     with open(filepath, "a", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(error_data.keys()))
+        writer = csv.DictWriter(f, fieldnames=names, extrasaction="ignore")
         if not file_exists or write_header:
             writer.writeheader()
         writer.writerow(error_data)
 
 
-def ensure_errors_csv(filepath: str) -> None:
+def ensure_errors_csv(filepath: str, fieldnames: list = None) -> None:
     """确保 errors.csv 存在（至少包含表头）"""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
-        headers = ["时间", "类目", "页码", "URL", "错误类型", "HTTP状态码", "重试次数", "错误详情"]
+        headers = fieldnames or ["时间", "类目", "页码", "URL", "错误类型", "HTTP状态码", "重试次数", "错误详情"]
         with open(filepath, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(headers)
