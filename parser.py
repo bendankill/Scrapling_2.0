@@ -344,6 +344,27 @@ def extract_next_page(html: str, current_url: str) -> Optional[str]:
     return None
 
 
+def extract_total_pages(html: str) -> Optional[int]:
+    """从分页组件中提取实际总页数"""
+    soup = BeautifulSoup(html, "lxml")
+    # 找 "X din Y" 格式 (页码 X of 总页数 Y)
+    max_page = 0
+    for item in soup.select('[class*="pagination"] a, [class*="pagination"] span'):
+        text = item.get_text(strip=True)
+        m = __import__('re').search(r'(\d+)\s*din\s*(\d+)', text)
+        if m:
+            total = int(m.group(2))
+            if total > max_page:
+                max_page = total
+        try:
+            n = int(text)
+            if n > max_page:
+                max_page = n
+        except ValueError:
+            pass
+    return max_page if max_page > 0 else None
+
+
 def page_has_products(html: str) -> bool:
     """检查页面是否包含商品"""
     if not html or len(html) < 100:
