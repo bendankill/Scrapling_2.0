@@ -1,4 +1,4 @@
-# eMAG 商品列表爬虫 V2.1.0
+# eMAG 商品列表爬虫 V2.1.1
 
 基于 [Scrapling](https://github.com/D4Vinci/Scrapling) 纯 HTTP Fetcher 的 eMAG（罗马尼亚电商）商品列表页爬虫。
 
@@ -6,13 +6,14 @@
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
-| **V2.1.0** | 2026-08-03 | 首个生产可用稳定版，整合 V2.0.x 全部修复 |
+| **V2.1.1** | 2026-08-03 | 断点续抓(checkpoint)、准确统计(PageResult)、Ctrl+C安全中断、统一RunStatus、唯一键持久化 |
+| V2.1.0 | 2026-08-03 | 首个生产可用稳定版，整合 V2.0.x 全部修复 |
 | V2.0.3 | 2026-08-03 | 按页码顺序提交、真正 Session 复用、--all-pages=20、图片错误追踪 |
 | V2.0.2 | 2026-08-03 | 依赖修复、403/429/511 统一 WAF 阻断、有界并发分页、跨类目去重隔离 |
 | V2.0.1 | 2026-08-03 | 纯 HTTP 改造（删除浏览器）、TXT 类目配置、JSON 标准输出、WAF 退出码 |
 | V2.0.0 | 2026-08-03 | 初始 MVP 版本 |
 
-> 当前最新版本为 **V2.1.0**。运行 `python main.py --version` 可确认本地版本。完整变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+> 当前最新版本为 **V2.1.1**。运行 `python main.py --version` 可确认本地版本。完整变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 重要：纯 HTTP 模式
 
@@ -30,6 +31,10 @@
 - 多类目并发抓取
 - 有界并发 + 按页码顺序提交分页
 - `--pages N` 严格最多 N 页，`--all-pages` 最多 20 页
+- **断点续抓**: 页面级快照 + checkpoint.json，任务暂停后可从断点恢复
+- **`--resume`**: 从 checkpoint 继续未完成任务
+- **Ctrl+C 安全中断**: 自动保存进度，退出码 130，下次可继续
+- **准确统计**: 每页 cards_found/products_parsed/parse_failed/duplicates/new_unique
 - 罗马尼亚价格格式正确解析
 - 商品主图下载（每商品最多 1 张），支持 JPEG/PNG/WebP/AVIF
 - CSV (UTF-8 BOM) / XLSX (格式化) / JSON (标准数组) 导出
@@ -86,6 +91,9 @@ cd /d D:\test\20260730_PaChong\V2.0
 .venv\Scripts\python.exe main.py --pages 3
 .venv\Scripts\python.exe main.py --all-pages
 .venv\Scripts\python.exe main.py --pages 10 --category-workers 2 --image-workers 8 --max-in-flight 16
+
+# 从断点恢复
+.venv\Scripts\python.exe main.py --resume "output\20260803_120000\checkpoint.json"
 ```
 
 ## 添加多个类目
@@ -123,6 +131,7 @@ https://www.emag.ro/mouse/c
 | `--config FILE` | 类目配置文件 | config/categories.txt |
 | `--output DIR` | 输出目录 | output/时间戳/ |
 | `--log-level` | 日志级别 (DEBUG/INFO/WARNING/ERROR) | INFO |
+| `--resume PATH` | 从 checkpoint.json 恢复任务 | - |
 | `--version` | 显示版本号 | - |
 
 ## 退出码说明
