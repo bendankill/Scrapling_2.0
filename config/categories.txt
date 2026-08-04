@@ -1,7 +1,37 @@
-# eMAG category URLs, one per line.
-# Lines starting with # are comments. Empty lines are ignored.
-# Only https://www.emag.ro/.../c and https://emag.ro/.../c paths are valid.
+# ============================================================
+# eMAG爬虫运行配置
+# 修改这里后，下次创建任务时自动读取并生效。
+# 命令行显式传入的参数优先级高于本文件。
+# ============================================================
 
+# 同一类目同时抓取的页面数量
+page_workers=1
+
+# 同时抓取的类目数量
+category_workers=1
+
+# 页面HTTP请求的最大在途数量
+max_in_flight=4
+
+# 图片下载线程数量
+image_workers=8
+
+# 图片下载最大在途请求数量
+image_max_in_flight=8
+
+# 每个商品需要下载的图片数量
+# 当前版本只抓主图，因此只允许0或1：
+# 0=不下载图片，1=下载一张主图
+images_per_product=1
+
+# ============================================================
+# eMAG类目URL配置
+# 每行一个URL；空行和以#开头的行会被忽略。
+# 用户可以自行增加、删除、更换或临时重复URL。
+# 程序运行时会跳过重复URL，但不会自动修改本文件。
+# ============================================================
+
+	
 https://www.emag.ro/laptopuri/c?ref=search_menu_category
 https://www.emag.ro/genti-laptop/c?ref=search_menu_category
-https://www.emag.ro/laptopuri/c?ref=search_menu_category
+

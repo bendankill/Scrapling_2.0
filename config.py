@@ -25,6 +25,14 @@ _INT_KEYS = {"page_workers", "category_workers", "max_in_flight",
              "image_workers", "image_max_in_flight", "images_per_product"}
 
 
+def _normalize_cat_url(url: str) -> str:
+    """统一URL标准化: 域名小写+路径小写+去查询参数+去尾部斜杠"""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.lower().rstrip("/")
+    return f"{host}{path}"
+
+
 def load_config(filepath: str) -> tuple[dict, list[str]]:
     """
     从 categories.txt 解析配置和类目URL。
@@ -58,9 +66,9 @@ def load_config(filepath: str) -> tuple[dict, list[str]]:
                 if not path.endswith("/c"):
                     errors.append((line_num, raw, f"URL 路径必须以 /c 结尾"))
                     continue
-                normalized = (host + path).lower()
-                if normalized in {u.lower().rstrip("/").split("?")[0] for u in urls}:
-                    print(f"[警告] 第{line_num}行 URL 重复: {line}", file=sys.stderr)
+                normalized = _normalize_cat_url(line)
+                if any(_normalize_cat_url(u) == normalized for u in urls):
+                    print(f"[警告] 第{line_num}行 URL 与已有类目重复，已跳过: {line}", file=sys.stderr)
                     continue
                 urls.append(line)
                 continue

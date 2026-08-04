@@ -62,15 +62,7 @@ def _detect_format(content: bytes, content_type: str = "") -> Optional[str]:
 
 
 def _verify_image(content: bytes, ext: str) -> bool:
-    """使用Pillow验证图片能否正常打开。avif/WebP若Pillow不支持则跳过"""
-    if ext in ('.avif', '.webp'):
-        try:
-            from io import BytesIO
-            from PIL import Image
-            Image.open(BytesIO(content)).verify()
-            return True
-        except Exception:
-            return True  # Pillow 可能不支持, 接受已通过魔数检测的图片
+    """使用Pillow严格验证所有图片格式 (JPEG/PNG/WebP/AVIF)"""
     try:
         from io import BytesIO
         from PIL import Image
@@ -202,17 +194,23 @@ class ImageDownloader:
                                     product_keys=[get_product_key(p) for p in products])
         with self._cache_lock:
             if url in self._url_path_cache:
-                first_path = self._url_path_cache[url]
-                # 从缓存为每个商品回填
+                cached = self._url_path_cache[url]  # (first_path, ext)
+                first_path, ext = cached if isinstance(cached, tuple) else (cached, os.path.splitext(cached)[1])
+                # 去重: 相同 composite_key 只处理一次
+                seen = set()
                 result = {}
                 for p in products:
                     ck = self._composite_key(p)
-                    pnk_name = self._make_pnk_filename(p)  # {PNK}.{ext}
-                    pnk_path = os.path.join(self.output_dir, pnk_name)
+                    if ck in seen: continue
+                    seen.add(ck)
+                    # 使用线程安全分配获取正式文件名
+                    base = self._make_pnk_basename(p)
+                    pnk_file = self._alloc_pnk_filename(
+                        (p.get("pnk") or "").strip(), p, ext)
+                    pnk_path = os.path.join(self.output_dir, pnk_file)
                     if os.path.exists(pnk_path):
                         result[ck] = pnk_path
                         continue
-                    # 创建硬链接或复制
                     self._link_or_copy(first_path, pnk_path)
                     if os.path.exists(pnk_path): result[ck] = pnk_path
                 return result
@@ -264,51 +262,50 @@ class ImageDownloader:
                                     detail=f"Image failed verification",
                                     product_keys=[get_product_key(p) for p in products])
 
-        # 写入第一个PNK文件 (原子写入), 然后为其他PNK创建硬链接
+        # 按 composite_key 去重后生成PNK文件
         result = {}
         first_path = None
-        for i, p in enumerate(products):
+        seen_ck = set()
+        for p in products:
             pnk = (p.get("pnk") or "").strip()
             if not pnk: self.missing_pnk_count += 1
             ck = self._composite_key(p)
+            if ck in seen_ck: continue  # 同PNK+同URL: 复用已有路径
+            seen_ck.add(ck)
+
             pnk_file = self._alloc_pnk_filename(pnk, p, detected_ext)
             pnk_path = os.path.join(self.output_dir, pnk_file)
 
-            if os.path.exists(pnk_path) and os.path.getsize(pnk_path) > 0:
-                result[ck] = pnk_path
-                first_path = first_path or pnk_path
-                continue
-
-            if i == 0:
-                # 原子写入第一张
-                self._atomic_write(pnk_path, content)
-                result[ck] = pnk_path
+            if first_path is None:
+                if not os.path.exists(pnk_path):
+                    self._atomic_write(pnk_path, content)
                 first_path = pnk_path
+                result[ck] = pnk_path
             else:
-                # 硬链接或复制
-                if first_path:
+                if not os.path.exists(pnk_path):
                     self._link_or_copy(first_path, pnk_path)
-                    if os.path.exists(pnk_path):
-                        result[ck] = pnk_path
+                if os.path.exists(pnk_path):
+                    result[ck] = pnk_path
 
+        # 缓存: 保存 (path, ext)
         if first_path:
             with self._cache_lock:
-                self._url_path_cache[url] = first_path
+                self._url_path_cache[url] = (first_path, detected_ext)
         return result
 
-    def _make_pnk_filename(self, product: dict) -> str:
-        """为商品生成PNK文件名(不含扩展名冲突解决, 仅基础名+ext)"""
+    def _make_pnk_basename(self, product: dict) -> str:
+        """从商品信息生成PNK基础名(不含扩展名)"""
         pnk = (product.get("pnk") or "").strip()
         if pnk:
             safe = _safe_pnk_name(pnk)
-            if safe: return f"{safe}_tmp"
+            if safe: return safe
         pid = (product.get("product_id") or "").strip()
         if pid:
             safe = _safe_pnk_name(pid)
-            if safe: return f"NO_PNK_{safe}_tmp"
+            if safe: return f"NO_PNK_{safe}"
         url = (product.get("main_image_url") or "").strip()
         h = hashlib.md5(url.encode()).hexdigest()[:12]
-        return f"NO_PNK_{h}_tmp"
+        return f"NO_PNK_{h}"
 
     def _alloc_pnk_filename(self, pnk: str, product: dict, ext: str) -> str:
         """线程安全分配PNK文件名。在锁内完成: 检查+预留+返回"""
