@@ -1,21 +1,19 @@
 """
-爬虫核心 V2.1.1-fix: 统一RunStatus, 顺序提交, 全部卡片保留, 并发去重修复
+爬虫核心 V2.1.2: 纯HTTP, 顺序提交, 全部卡片保留
 """
-import hashlib, json, logging, os, signal, time, threading
+import hashlib, json, logging, os, time, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Lock, Semaphore, Event
 from typing import Optional
-
 from scrapling.fetchers import FetcherSession
 from models import ProductItem
 from parser import parse_product_listing, extract_next_page, extract_total_pages, page_has_products
 from image_downloader import ImageDownloader
 from exporters import Exporters
-from checkpoint import CheckpointManager, RunStatus
 from utils import (detect_waf_block, WafBlockError, get_product_key,
-    write_errors_csv, write_atomic_json, ensure_errors_csv)
+    write_errors_csv, write_atomic_json, ensure_errors_csv, RunStatus)
 
 logger = logging.getLogger("emag_crawler.crawler")
 ALL_PAGES_LIMIT = 20
@@ -28,7 +26,7 @@ class PageResult:
     duplicates: int = 0; new_unique_products: int = 0
     next_url: str = ""; has_next: bool = False; is_last_page: bool = False
     products: list = field(default_factory=list)
-    all_products: list = field(default_factory=list)  # 全部卡片(含重复)
+    all_products: list = field(default_factory=list)
     product_keys: list = field(default_factory=list)
     parse_errors: list = field(default_factory=list)
     html_hash: str = ""; waf_error = None; total_pages: Optional[int] = None
@@ -59,14 +57,14 @@ class CategoryStats:
 class EmagCrawler:
     def __init__(self, output_dir, image_downloader=None, page_workers=3,
                  category_workers=2, max_in_flight=8, download_images=True,
-                 all_pages=False, checkpoint=None, stop_event=None):
+                 all_pages=False, stop_event=None):
         self.output_dir = output_dir
         self.download_images = download_images
         self.image_downloader = image_downloader
         self.page_workers = page_workers
         self.category_workers = category_workers
         self.all_pages = all_pages
-        self.cp = checkpoint or CheckpointManager(output_dir)
+        self._run_status = RunStatus.RUNNING
         self.global_semaphore = Semaphore(max_in_flight)
         self.exporters = Exporters(output_dir)
         self.stats: dict[str, CategoryStats] = {}
@@ -81,6 +79,9 @@ class EmagCrawler:
                                 "timeout": 30, "retries": 3, "retry_delay": 1}
         self._all_sessions: list = []; self._sessions_lock = Lock()
         self._cat_page_hashes: dict[str, set] = {}; self._hash_lock = Lock()
+        # 运行内唯一商品键集合 (替代已删除的 checkpoint)
+        self._product_keys: set = set()
+        self._keys_lock = Lock()
         os.makedirs(output_dir, exist_ok=True)
 
     # ---- Session ----
@@ -98,6 +99,16 @@ class EmagCrawler:
                 try: mgr.__exit__(None, None, None)
                 except Exception: pass
             self._all_sessions.clear()
+
+    # ---- 原子产品键 (运行内) ----
+    def _check_and_add_product_keys(self, keys: list) -> tuple:
+        """原子操作: 检查并添加产品键。返回 (new_keys, dup_count)"""
+        new, dup = [], 0
+        with self._keys_lock:
+            for k in keys:
+                if k in self._product_keys: dup += 1
+                else: self._product_keys.add(k); new.append(k)
+        return new, dup
 
     # ---- 页面获取 ----
     def _fetch_page(self, url):
@@ -122,26 +133,18 @@ class EmagCrawler:
     # ---- 单页解析 (纯工作线程, 不修改全局状态) ----
     def _fetch_and_parse_page(self, name, base_url, page_num, page_url) -> PageResult:
         pr = PageResult(page_number=page_num, page_url=page_url)
-        html, st = self._fetch_page(page_url)
-        pr.http_status = st
-
+        html, st = self._fetch_page(page_url); pr.http_status = st
         waf = detect_waf_block(html or "", st, page_url, category=name, page_num=page_num)
         if waf: pr.waf_error = waf; return pr
         if st != 200 or not html: return pr
         if not page_has_products(html): pr.is_last_page = True; return pr
-
         pr.html_hash = hashlib.md5(html.encode()).hexdigest()
         pr.next_url = extract_next_page(html, page_url) or ""
-        pr.has_next = bool(pr.next_url)
-        pr.total_pages = extract_total_pages(html)
-
+        pr.has_next = bool(pr.next_url); pr.total_pages = extract_total_pages(html)
         products, parse_errors = self._parse_products(html, name, base_url, page_url, page_num)
         pr.cards_found = len(products) + len(parse_errors)
-        pr.products_parsed = len(products)
-        pr.parse_failed = len(parse_errors)
-        pr.parse_errors = parse_errors
-        # 保存全部解析成功的卡片 (不去重)
-        pr.all_products = list(products)
+        pr.products_parsed = len(products); pr.parse_failed = len(parse_errors)
+        pr.parse_errors = parse_errors; pr.all_products = list(products)
         return pr
 
     def _parse_products(self, html, name, base_url, page_url, page_num):
@@ -169,60 +172,39 @@ class EmagCrawler:
         return products, errors
 
     # ---- 类目抓取 ----
-    def crawl_category(self, name, url, max_pages=None, resume_from=1):
+    def crawl_category(self, name, url, max_pages=None):
         stats = CategoryStats(name, url)
         with self._stats_lock: self.stats[name] = stats
         hard_limit = max_pages if max_pages is not None else (ALL_PAGES_LIMIT if self.all_pages else 1)
-        if resume_from > 1: logger.info(f"[{name}] 从第{resume_from}页恢复")
-
-        if not self.cp.get_category(url):
-            self.cp.init_category(name, url, effective_pages=hard_limit)
+        logger.info(f"[{name}] 开始: {url} (限制: {hard_limit} 页)")
 
         # --- 首页 ---
-        if resume_from == 1:
-            pr = self._fetch_and_parse_page(name, url, 1, url); stats.requested_pages += 1
-            if pr.waf_error:
-                self._handle_stop(RunStatus.PAUSED_WAF, name, 1, pr.page_url,
-                                  pr.waf_error, getattr(pr, '_html', "")); return stats
-            if pr.http_status != 200:
-                stats.failed_pages += 1
-                self._handle_stop(RunStatus.PAUSED_NETWORK, name, 1, url, None, "")
-                return stats
-            if pr.cards_found == 0 and pr.is_last_page:
-                stats.stop_reason = "empty_category"
-                self.cp.mark_category_done(url, "empty_category"); return stats
-            # 全部解析失败检查
-            if pr.cards_found > 0 and pr.products_parsed == 0 and pr.parse_failed > 0:
-                self._commit_page_errors(name, url, pr)
-                self.cp.mark_page_partial(url, 1)
-                stats.stop_reason = "parse_error"
-                self.cp.set_status(RunStatus.FAILED, "all_parse_failed_page1")
-                return stats
-            self._commit_page(name, url, pr, stats)
-            effective = min(hard_limit, pr.total_pages) if pr.total_pages else hard_limit
-            self.cp.update_category(url, effective_pages=effective)
-            if hard_limit <= 1 or not pr.has_next:
-                stats.stop_reason = "no_next_page" if not pr.has_next else "requested_limit_reached"
-                self.cp.mark_category_done(url, stats.stop_reason); return stats
-        else:
-            effective = hard_limit
+        pr = self._fetch_and_parse_page(name, url, 1, url); stats.requested_pages += 1
+        if pr.waf_error:
+            self._handle_stop(RunStatus.WAF_BLOCKED, name, 1, pr.page_url, pr.waf_error); return stats
+        if pr.http_status != 200:
+            stats.failed_pages += 1
+            self._handle_stop(RunStatus.NETWORK_ERROR, name, 1, url, detail=f"HTTP {pr.http_status}"); return stats
+        if pr.cards_found == 0 and pr.is_last_page:
+            stats.stop_reason = "empty_category"; return stats
+        if pr.cards_found > 0 and pr.products_parsed == 0 and pr.parse_failed > 0:
+            self._commit_page_errors(name, url, pr)
+            stats.stop_reason = "parse_error"
+            self._run_status = RunStatus.NETWORK_ERROR; return stats
+        self._commit_page(name, url, pr, stats)
+        effective = min(hard_limit, pr.total_pages) if pr.total_pages else hard_limit
+        if hard_limit <= 1 or not pr.has_next:
+            stats.stop_reason = "no_next_page" if not pr.has_next else "requested_limit_reached"; return stats
 
         # --- 并发后续页 ---
         import re as _re
         url_template = None
-        if resume_from == 1 and pr.has_next:
+        if pr.has_next:
             m = _re.match(r'(.*?/p)(\d+)(/c.*)', pr.next_url)
             if m: url_template = (m.group(1), m.group(3))
-        elif resume_from > 1:
-            m = _re.match(r'(.*?/p)(\d+)(/c.*)', url)
-            if m: url_template = (m.group(1), m.group(3))
-
-        start_page = max(resume_from, 2)
-        pending = list(range(start_page, effective + 1))
-        completed_buf: dict[int, PageResult] = {}
-        in_flight: dict[Future, int] = {}
-        next_idx, stopped = 0, False
-        lock = Lock()
+        start_page = 2; pending = list(range(start_page, effective + 1))
+        completed_buf: dict[int, PageResult] = {}; in_flight: dict[Future, int] = {}
+        next_idx, stopped = 0, False; lock = Lock()
 
         with ThreadPoolExecutor(max_workers=self.page_workers) as ex:
             while next_idx < len(pending) and len(in_flight) < self.page_workers:
@@ -246,26 +228,19 @@ class EmagCrawler:
                     while next_expected in completed_buf and not stopped:
                         pr = completed_buf.pop(next_expected)
                         if pr.waf_error:
-                            self._handle_stop(RunStatus.PAUSED_WAF, name, next_expected,
-                                            pr.page_url, pr.waf_error, "")
+                            self._handle_stop(RunStatus.WAF_BLOCKED, name, next_expected, pr.page_url, pr.waf_error)
                             self._stop_event.set(); stopped = True; break
                         if pr.http_status != 200:
                             stats.failed_pages += 1
-                            self._handle_stop(RunStatus.PAUSED_NETWORK, name, next_expected,
-                                            pr.page_url, None, f"HTTP {pr.http_status}")
+                            self._handle_stop(RunStatus.NETWORK_ERROR, name, next_expected, pr.page_url, detail=f"HTTP {pr.http_status}")
                             stopped = True; break
-                        if pr.cards_found == 0:
-                            self.cp.mark_category_done(url, "empty_page"); stopped = True; break
-                        # 全部解析失败
+                        if pr.cards_found == 0: stopped = True; break
                         if pr.cards_found > 0 and pr.products_parsed == 0 and pr.parse_failed > 0:
                             self._commit_page_errors(name, url, pr)
-                            self.cp.mark_page_partial(url, next_expected)
-                            self.cp.set_status(RunStatus.FAILED, f"all_parse_failed_p{next_expected}")
-                            stopped = True; break
+                            self._run_status = RunStatus.NETWORK_ERROR; stopped = True; break
                         self._commit_page(name, url, pr, stats)
                         if not pr.has_next or pr.is_last_page:
-                            stats.stop_reason = "actual_last_page_reached"
-                            self.cp.mark_category_done(url, stats.stop_reason); stopped = True; break
+                            stats.stop_reason = "actual_last_page_reached"; stopped = True; break
                         next_expected += 1
 
                 while (not stopped and not self._stop_event.is_set()
@@ -278,71 +253,38 @@ class EmagCrawler:
 
             for fut in list(in_flight.keys()): fut.cancel()
 
-        if not stats.stop_reason:
-            stats.stop_reason = "requested_limit_reached"
-            self.cp.mark_category_done(url, stats.stop_reason)
+        if not stats.stop_reason: stats.stop_reason = "requested_limit_reached"
         stats.end_time = time.time()
         return stats
 
     def _commit_page(self, name, base_url, pr: PageResult, stats: CategoryStats):
-        """按序提交: 去重在锁内原子完成, 输出去重前后数据"""
         self._check_and_add_hash(base_url, pr.html_hash) if pr.html_hash else None
-
         for err in pr.parse_errors:
             self._log_error(name, pr.page_number, pr.page_url, err.get("error_type","PARSE_FAILED"),
                           detail=err.get("error_detail",""), product_key=err.get("product_id",""))
 
-        # S0-7: 输出全部解析成功的卡片 (all_products), 不管重复
         all_prods = pr.all_products
-        if all_prods:
-            self.cp.save_page_snapshot(base_url, pr.page_number, all_prods)
-
-        # S1-2修复: 去重在锁内原子完成, new_unique=len(added_keys), dup=total-added
-        new_products, dup_count = [], 0
-        new_keys = []
+        new_products, dup_count, added_keys = [], 0, []
         if all_prods:
             all_keys = [get_product_key(p.to_dict()) for p in all_prods]
-            added_keys, dup_count = self.cp.check_and_add_product_keys(all_keys)
-            # S1-2: new_unique_products = len(added_keys) (首次出现的键数)
-            # duplicates = 总键数 - 新键数
-            new_keys = added_keys
-            # 按出现顺序保留首次新增的商品
-            added_set = set(added_keys)
-            seen_new = set()
+            added_keys, dup_count = self._check_and_add_product_keys(all_keys)
+            added_set = set(added_keys); seen_new = set()
             for p in all_prods:
                 k = get_product_key(p.to_dict())
-                if k in added_set and k not in seen_new:
-                    new_products.append(p)
-                    seen_new.add(k)
+                if k in added_set and k not in seen_new: new_products.append(p); seen_new.add(k)
+        pr.new_unique_products = len(added_keys); pr.duplicates = dup_count
+        pr.products = new_products; pr.product_keys = added_keys
+        for p in all_prods: self.exporters.add_product(p)
 
-        pr.new_unique_products = len(added_keys) if all_prods else 0
-        pr.duplicates = dup_count
-        pr.products = new_products
-        pr.product_keys = new_keys
-
-        # 全部成功卡片都写入 Exporters
-        for p in all_prods:
-            self.exporters.add_product(p)
-
-        stats.success_pages += 1
-        stats.total_records += len(all_prods)  # S0-7: 总记录=全部卡片
-        stats.cards_found += pr.cards_found
-        stats.products_parsed += pr.products_parsed
-        stats.parse_failed += pr.parse_failed
-        stats.duplicates += dup_count
-        stats.new_unique += (len(added_keys) if all_prods else 0)
-
-        self.cp.mark_page_completed(base_url, pr.page_number,
-            cards_found=pr.cards_found, products_parsed=pr.products_parsed,
-            parse_failed=pr.parse_failed, duplicates=dup_count,
-            new_unique=(len(added_keys) if all_prods else 0))
-
+        stats.success_pages += 1; stats.total_records += len(all_prods)
+        stats.cards_found += pr.cards_found; stats.products_parsed += pr.products_parsed
+        stats.parse_failed += pr.parse_failed; stats.duplicates += dup_count
+        stats.new_unique += len(added_keys)
         logger.info(f"[{name}] P{pr.page_number}: cards={pr.cards_found} "
                     f"parsed={pr.products_parsed} fail={pr.parse_failed} "
-                    f"dup={dup_count} new={len(new_products)}")
+                    f"dup={dup_count} new={len(added_keys)}")
 
     def _commit_page_errors(self, name, base_url, pr: PageResult):
-        """只记录解析错误, 不标记完成"""
         for err in pr.parse_errors:
             self._log_error(name, pr.page_number, pr.page_url, err.get("error_type","PARSE_FAILED"),
                           detail=err.get("error_detail",""), product_key=err.get("product_id",""))
@@ -354,18 +296,14 @@ class EmagCrawler:
         if not categories: return {}
         for cat in categories:
             if self._stop_event.is_set(): break
-            cu = cat["url"]; cc = self.cp.get_category(cu)
-            status = self.cp.get_status()
-            if status.is_stopped: break
-            if cc and cc.get("status") == "completed": continue
-            rf = cc["next_page"] if cc else 1
-            self.crawl_category(cat["name"], cu, max_pages, rf)
-            if self.cp.get_status().is_stopped: break
+            if self._run_status.is_stopped: break
+            self.crawl_category(cat["name"], cat["url"], max_pages)
+            if self._run_status.is_stopped: break
         return {}
 
-    # ---- 统一停止处理 ----
+    # ---- 停止处理 (V2.1.2: 无断点恢复提示) ----
     def _handle_stop(self, status: RunStatus, name, page_num, url, waf=None, detail=""):
-        self._stop_event.set()
+        self._stop_event.set(); self._run_status = status
         ts = datetime.now(timezone.utc).isoformat()
         if waf:
             self._log_error(name, page_num, url, f"WAF_{waf.block_type}", waf.status_code, detail=waf.evidence)
@@ -376,38 +314,18 @@ class EmagCrawler:
                  "page": page_num, "url": url, "http_status": waf.status_code,
                  "block_type": waf.block_type, "evidence": waf.evidence})
         else:
-            self._log_error(name, page_num, url, f"NETWORK_ERROR", detail=detail)
+            self._log_error(name, page_num, url, "NETWORK_ERROR", detail=detail)
 
-        self.cp.set_status(status, status.value)
-
-        sys_mod = __import__('sys')
-        if status == RunStatus.PAUSED_WAF:
-            print(f"\n{'!'*60}\n  检测到WAF/验证码，任务已停止。进度已保存。\n{'!'*60}", file=sys_mod.stderr)
-        else:
-            print(f"\n{'!'*60}\n  网络错误，任务已暂停。进度已保存。\n{'!'*60}", file=sys_mod.stderr)
-
-        print(f"  HTTP状态码: {waf.status_code if waf else detail}", file=sys_mod.stderr)
-        print(f"  类目: {name}  页码: {page_num}", file=sys_mod.stderr)
-        self._print_resume_help()
-
-    def _print_resume_help(self):
-        cp_path = os.path.abspath(self.cp.checkpoint_path)
         s = __import__('sys')
-        print(f"\n  继续命令:", file=s.stderr)
-        print(f'  .venv\\Scripts\\python.exe main.py --resume "{cp_path}"', file=s.stderr)
-        print(f"  或双击: {os.path.join(self.output_dir, 'resume.bat')}", file=s.stderr)
-        self._write_resume_files()
-
-    def _write_resume_files(self):
-        cp_path = os.path.abspath(self.cp.checkpoint_path)
-        proj = os.path.abspath(os.path.join(os.path.dirname(__file__)))
-        with open(os.path.join(self.output_dir, "RESUME_COMMAND.txt"), "w", encoding="utf-8") as f:
-            f.write(f'cd /d "{proj}"\n.venv\\Scripts\\python.exe main.py --resume "{cp_path}"\n')
-        with open(os.path.join(self.output_dir, "resume.bat"), "w", encoding="utf-8", newline="\r\n") as f:
-            f.write('@echo off\nchcp 65001 >nul\n')
-            f.write(f'cd /d "{proj}"\n')
-            f.write(f'".venv\\Scripts\\python.exe" main.py --resume "{cp_path}"\n')
-            f.write('echo Exit code: %ERRORLEVEL%\npause\n')
+        if status == RunStatus.WAF_BLOCKED:
+            print(f"\n{'!'*60}\n  检测到WAF/验证码，任务已终止。\n"
+                  f"  当前版本不支持断点续抓，请重新执行原抓取命令。\n{'!'*60}", file=s.stderr)
+        else:
+            print(f"\n{'!'*60}\n  网络错误，任务已终止。\n"
+                  f"  当前版本不支持断点续抓，请重新执行原抓取命令。\n{'!'*60}", file=s.stderr)
+        if waf: print(f"  HTTP状态码: {waf.status_code}", file=s.stderr)
+        else: print(f"  详情: {detail}", file=s.stderr)
+        print(f"  类目: {name}  页码: {page_num}", file=s.stderr)
 
     # ---- 错误 ----
     ERROR_FIELDNAMES = ["时间","类目","页码","商品键","URL","错误类型","HTTP状态码","重试次数","错误详情"]
@@ -424,10 +342,8 @@ class EmagCrawler:
         for err in img_stats.get("errors", []):
             self._log_error(name=err.get("category",""), page=err.get("page",0),
                 url=err.get("image_url", err.get("url","")),
-                error_type=err.get("error_type","IMAGE_ERROR"),
-                http_status=err.get("http_status",0),
-                detail=err.get("error_detail",str(err)),
-                product_key=err.get("product_key",""))
+                error_type=err.get("error_type","IMAGE_ERROR"), http_status=err.get("http_status",0),
+                detail=err.get("error_detail",str(err)), product_key=err.get("product_key",""))
 
     def download_images_for_products(self):
         if not self.image_downloader: return {}
@@ -463,22 +379,20 @@ class EmagCrawler:
                         cat_count += 1; cat_keys.add(get_product_key(item))
                         if item.get("main_image_local_path"): img_ok += 1
                         elif item.get("main_image_url"): img_fail += 1
-                stats.total_records = cat_count
-                stats.unique_products = len(cat_keys)
+                stats.total_records = cat_count; stats.unique_products = len(cat_keys)
                 stats.image_success = img_ok; stats.image_failed = img_fail
 
         ensure_errors_csv(self.errors_file, self.ERROR_FIELDNAMES)
         self.exporters.finalize()
 
-        # S0-4/5: 统一状态判定
         if interrupted:
-            self.cp.set_status(RunStatus.INTERRUPTED)
-        elif not self.cp.get_status().is_stopped:
-            self.cp.set_status(RunStatus.COMPLETED)
+            self._run_status = RunStatus.INTERRUPTED
+        elif not self._run_status.is_stopped:
+            self._run_status = RunStatus.COMPLETED
 
-        status = self.cp.get_status()
+        status = self._run_status
         summary = {
-            "version": "2.1.1", "status": status.value,
+            "version": "2.1.2", "status": status.value,
             "start_time": datetime.fromtimestamp(self.start_time, tz=timezone.utc).isoformat(),
             "end_time": datetime.now(timezone.utc).isoformat(),
             "elapsed_seconds": round(total_elapsed, 2),
@@ -490,8 +404,7 @@ class EmagCrawler:
                 "failed_pages": sum(s.failed_pages for s in self.stats.values())},
         }
         write_atomic_json(os.path.join(self.output_dir, "run_summary.json"), summary)
-        logger.info(f"汇总: status={status.value}")
         return summary
 
     def get_exit_code(self):
-        return self.cp.get_status().exit_code
+        return (RunStatus.INTERRUPTED if self._interrupted else self._run_status).exit_code

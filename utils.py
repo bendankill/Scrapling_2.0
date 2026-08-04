@@ -1,16 +1,9 @@
 """
-工具函数：日志、价格解析、URL处理、TXT配置加载、WAF/Captcha检测、产品键
-V2.0.2 — 403/429/511 统一视为WAF阻断
+工具函数 V2.1.2: 日志、价格解析、URL处理、TXT配置加载、WAF检测、产品键、RunStatus
 """
-import re
-import os
-import json
-import csv
-import logging
-import sys
-import hashlib
+import re, os, json, csv, logging, sys, hashlib
 from datetime import datetime
-from pathlib import Path
+from enum import Enum
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -18,11 +11,29 @@ from urllib.parse import urlparse
 # ============================================================
 # 退出码定义
 # ============================================================
-EXIT_SUCCESS = 0           # 成功且抓到商品
-EXIT_CONFIG_ERROR = 1      # 配置或参数错误
-EXIT_NETWORK_ERROR = 2     # 网络、解析或全部页面失败
-EXIT_CAPTCHA = 3           # 检测到验证码/WAF/403/429/511, 需要人工处理
-EXIT_INTERRUPT = 130       # 用户中断 (Ctrl+C)
+EXIT_SUCCESS = 0; EXIT_CONFIG_ERROR = 1; EXIT_NETWORK_ERROR = 2
+EXIT_CAPTCHA = 3; EXIT_INTERRUPT = 130
+
+
+# ============================================================
+# 统一运行状态 (从 checkpoint.py 迁移, 去掉断点相关状态)
+# ============================================================
+class RunStatus(str, Enum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    NETWORK_ERROR = "network_error"
+    WAF_BLOCKED = "waf_blocked"
+    INTERRUPTED = "interrupted"
+
+    @property
+    def exit_code(self) -> int:
+        return {RunStatus.COMPLETED: 0, RunStatus.RUNNING: 0,
+                RunStatus.NETWORK_ERROR: 2, RunStatus.WAF_BLOCKED: 3,
+                RunStatus.INTERRUPTED: 130}[self]
+
+    @property
+    def is_stopped(self) -> bool:
+        return self != RunStatus.RUNNING
 
 
 # ============================================================
