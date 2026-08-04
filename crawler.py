@@ -364,8 +364,10 @@ class EmagCrawler:
         if path_map:
             with self.exporters._lock:
                 for item in self.exporters._products:
-                    key = get_product_key(item)
-                    if key in path_map: item["main_image_local_path"] = path_map[key]
+                    # V2.1.3: 复合键 {product_key}|{url_hash} 区分同PNK不同URL
+                    ck = f"{get_product_key(item)}|{hashlib.md5((item.get('main_image_url') or '').encode()).hexdigest()[:8]}"
+                    if ck in path_map: item["main_image_local_path"] = path_map[ck]
+                    elif get_product_key(item) in path_map: item["main_image_local_path"] = path_map[get_product_key(item)]
 
         sorted_prods = self.exporters.get_products_sorted()
         total_records = len(sorted_prods)
