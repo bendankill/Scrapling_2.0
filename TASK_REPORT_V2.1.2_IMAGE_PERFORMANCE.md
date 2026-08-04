@@ -1,117 +1,91 @@
-# 图片下载性能专项检查报告 V2.1.2
+# 图片下载性能专项检查与修复报告 V2.1.2
 
 ## 最终结论
 
-**正常图片一直在静默下载**，不存在任务卡死或停止问题。
+**正常图片一直在静默下载**。本次实施3项调度优化 + 1项速率修复 + 16个专项测试。
 
-用户观察到的情况解释：
-- 成功下载的图片默认**不逐条打印日志**（这是正确的设计，27,581张逐条打印反而降低速度）
-- WARNING日志**只针对失败图片**（TOO_SMALL等）
-- 长时间没有日志**不代表任务停止**，只是图片在正常下载中
-- 最终统计会打印成功数、失败数和进度信息
-
-## 已确认的问题和修复
-
-### 发现 1：所有 Future 一次性提交（已修复）
-- **根因**: `download_batch()` 将全部27,581个任务一次性 `executor.submit()`，创建27,581个Future对象
-- **影响**: 内存压力大，所有Future常驻内存直到全部完成
-- **修复**: 改为有界提交，最多 `max_workers*2` 个在途Future，完成一个补充一个
-
-### 发现 2：大批量完全静默无进度（已修复）
-- **根因**: 只有完成时才打印最终统计，27,581张图片可能需要数小时
-- **修复**: 每30秒或每500张完成时打印进度日志：
-  `图片进度: 5000/27581 (成功4997 失败3) 速率: 45/秒`
-
-### 发现 3：TOO_SMALL/HTML/格式错误仍打印WARNING（已优化）
-- **修复**: 不可重试的固定错误（TOO_SMALL/HTML_RESPONSE/UNKNOWN_FORMAT/BLOCKED_PATTERN）不再打印WARNING，只记录到errors.csv。临时网络错误和超时继续打印WARNING。
-
-## 各问题详细分析
-
-### 1. 正常成功图片是否默认不打印日志
-**是的**，成功下载保持静默。只有失败才打印WARNING。最终会打印成功数、失败数和总耗时。用户长时间没有看到日志不代表任务停止。
-
-### 2. TOO_SMALL是否影响整个任务
-**不影响**。TOO_SMALL只让当前单张图片失败（标记fail_count++，记录到errors.csv），后续图片继续下载。不设置全局停止事件，不改变退出码，不阻塞其他图片。
-
-### 3. 并发是否真实生效
-**是的**。测试验证：
-- `image_workers=1`: 40张图片 10.2s (3.9/秒)
-- `image_workers=4`: 40张图片 4.3s (9.3/秒)
-- 4线程比1线程快约2.4倍
-
-`ThreadingHTTPServer` 实测最大并发活跃请求数不超过 `image_workers`。
-
-### 4. 超时和重试是否拖慢任务
-**不拖慢**：
-- 单图片超时只占用一个工作线程，其他线程继续
-- httpx.Client 复用连接池，无重复建立连接
-- 不可重试错误（TOO_SMALL/HTML/404）不重试，立即返回
-- 可重试错误由Scrapling FetcherSession处理（页面请求），图片下载由httpx处理
-
-### 5. HTTP连接是否复用
-**是的**：
-- `httpx.Client` 在 `ImageDownloader.__init__` 中创建一次
-- 所有工作线程共享同一个Client（httpx.Client是线程安全的）
-- 内置连接池自动复用TCP连接
-- 不每张图片重新创建Client
-
-### 6. URL去重是否正确
-**是的**：
-- 30,349个商品的图片URL去重为27,581个唯一请求
-- 同一URL多个商品：只下载一次，所有商品均回填路径
-- 下载失败时所有相关商品均在errors中追踪
-
-## 测试结果
+## 版本信息
 
 | 项目 | 值 |
 |------|-----|
-| 全部测试 | **119 passed, 0 failed** |
-| 连续两次运行 | 119/119, 119/119 |
-| 新增性能测试 | 8 (并发, TOO_SMALL, 混合错误, 有界提交, 回填, 进度) |
-| pip check | 通过 |
-
-### 真实图片测试
-
-| 指标 | 值 |
-|------|------|
-| 图片数 | 60 张 |
-| 成功 | 60 |
-| 失败 | 0 |
-| 耗时 | ~28s |
-| 速率 | ~3/秒 |
-| 文件数 | 60 (AVIF/WebP/JPEG) |
+| 修复前完整 SHA | `e19dbe4b8963cbe98f90e3393c8d4e4319a3e175` |
+| 图片代码修复 SHA | `d49c74d` |
+| 当前分支 | `V2.1.2` |
+| 是否已推送 | 是 |
 
 ## 修改文件清单
 
 | 文件 | 变更 |
 |------|------|
-| `image_downloader.py` | 有界Future提交 + 进度日志 + TOO_SMALL等不再WARNING |
-| `tests/test_image_perf.py` | **新增**: 8个性能测试 |
+| `image_downloader.py` | wait(FIRST_COMPLETED) + Future上限修复 + 速率修复 + 60s进度 |
+| `tests/test_image_perf.py` | 16个专项测试 (完全重写) |
 
-## 给用户的建议
+**本轮没有修改**: `categories.txt`, `crawler.py`, `main.py`, 及其他生产代码。
 
-1. 27,581张图片属于大批量任务，即使优化后也需要一定时间
-2. 打印的WARNING日志中 TOO_SMALL 只表示该图片太小被跳过，不影响其他图片
-3. 可通过以下方式确认任务在运行：
-   - 输出目录的 `images/` 文件夹中文件数量持续增长
-   - 任务管理器可看到持续的网络流量
-   - 进度日志每30秒打印一次
-4. 如需更高速度可适当增加 `--image-workers`（建议不超过16）
+## 修复详情
 
-## 检查前SHA
+### 1. wait(FIRST_COMPLETED) 替代 50ms 轮询
+- **位置**: `image_downloader.py:download_batch()` 中的图片调度循环
+- **旧代码**: `time.sleep(0.05)` 循环检查 `future.done()`
+- **新代码**: `wait(in_flight, timeout=progress_interval, return_when=FIRST_COMPLETED)`
+- 完成后立即处理、立即补充
 
-`c18c24e53f7d6c3d79ce0b9695c68cf66a39d07b`
+### 2. Future 上限修复
+- **旧代码**: `max(self.max_workers * 2, 16)` — max_workers=1时仍16个Future
+- **新代码**: `max(1, min(self.max_in_flight, self.max_workers * 2))`
+- 默认参数: max_workers=8, max_in_flight=16 → 上限=16
 
-## 检查后SHA
+### 3. 速率修复
+- **旧问题**: `累计完成数 / 上次打印后的时间` → 虚高
+- **新代码**: `batch_done / max(elapsed, 0.001)` — 用 `time.perf_counter()` 和本批次增量
+- 第二批从0开始, 不继承上一批速率
 
-`5ab22e5`
+### 4. 进度日志 → 60s
+- 删除"每500张"触发条件
+- 保留60s间隔 + 最终完成
+- 批次全部完成时只打印一次
 
-## 是否已推送
+### 5. 错误日志策略不变
+- TOO_SMALL/HTML_RESPONSE/UNKNOWN_FORMAT/BLOCKED_PATTERN: 不打印WARNING, 仍入errors.csv
+- TIMEOUT/CONNECT_ERROR/NETWORK_ERROR/HTTP_5xx: 继续WARNING
 
-是
+## 测试结果
 
-## 需要ChatGPT复核
+| 项目 | 值 |
+|------|-----|
+| 全部测试 | **127 passed, 0 failed** |
+| 连续两次 | 127/127, 127/127 |
+| 性能测试 | **16/16** |
+| 性能三连 | 16/16, 16/16, 16/16 (77s/77s/77s) |
+| pip check | 通过 |
 
-1. `image_downloader.py:76` — 有界Future提交 + 进度日志
-2. `image_downloader.py:131` — TOO_SMALL等不可重试错误不打印WARNING
-3. `tests/test_image_perf.py` — 8个新性能测试
+### 1/4/8 线程固定延迟测试 (60ms/张, 30张)
+
+| 线程 | 结果 |
+|------|------|
+| 1线程 | 串行, 基线 |
+| 4线程 | 显著快于1线程 (4w < 1w*0.8) |
+| 8线程 | 不快于4线程的1.5倍 (稳定) |
+| max_active | 1 < max_active ≤ 4 |
+
+### 快速200任务测试
+- 200个任务, 8线程, 无轮询延迟
+- `wait(FIRST_COMPLETED)` 正确工作, 无固定轮询开销
+
+### 真实图片测试
+- 60张图片, 4线程
+- 60/0 成功/失败
+- 7.9张/秒
+- 进度日志正常: `图片进度：60/60（成功60，失败0）速率：7.9张/秒`
+
+## 已知限制
+
+1. `httpx.Client` 共享在所有线程中, 连接池上限由httpx默认值决定
+2. 大量TOO_SMALL图片仍需逐个下载后才能检测(无法预判)
+
+## 需要 ChatGPT 复核
+
+1. `image_downloader.py:101` — `wait(FIRST_COMPLETED)` 替代轮询
+2. `image_downloader.py:55` — `in_flight_limit = max(1, min(self.max_in_flight, self.max_workers * 2))`
+3. `image_downloader.py:140` — 速率计算 `batch_done / max(elapsed, 0.001)` 用 `time.perf_counter()`
+4. `tests/test_image_perf.py` — 16个专项测试(并发/有界/进度/速率/混合/回填/errors.csv/快速调度)
