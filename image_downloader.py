@@ -4,6 +4,7 @@
 import os
 import hashlib
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Semaphore, Lock
 from typing import Optional
@@ -75,7 +76,7 @@ class ImageDownloader:
 
     def download_batch(self, products: list[dict]) -> dict[str, str]:
         """
-        批量下载图片。仅下载不抛出, 错误记录到 self.errors。
+        批量下载图片。有界Future提交, 错误记录到 self.errors。
         返回: {product_key: local_path}
         """
         unique_products: dict[str, dict] = {}
@@ -92,57 +93,85 @@ class ImageDownloader:
                 url_to_keys[url] = []
             url_to_keys[url].append(key)
 
-        logger.info(f"准备下载 {len(url_to_keys)} 个唯一URL (对应 {len(unique_products)} 个商品)")
+        total = len(url_to_keys)
+        logger.info(f"准备下载 {total} 个唯一URL (对应 {len(unique_products)} 个商品)")
 
         result: dict[str, str] = {}
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {}
-            for url, keys in url_to_keys.items():
-                # 传入一个商品用于获取类目/页码信息
-                sample = unique_products[keys[0]]
-                future = executor.submit(self._download_single, url, sample, keys)
-                futures[future] = (url, keys)
+        url_items = list(url_to_keys.items())
+        # 有界提交: 一次最多提交 max_workers*2 个, 完成一个补充一个
+        in_flight_max = max(self.max_workers * 2, 16)
+        in_flight: dict = {}
+        next_idx = 0
+        last_progress = time.time()
+        completed_since_last = 0
 
-            for future in as_completed(futures):
-                url, keys = futures[future]
-                try:
-                    local_path = future.result()
-                    if local_path:
-                        for key in keys:
-                            result[key] = local_path
-                        self.success_count += 1
-                        with self._cache_lock:
-                            self._url_path_cache[url] = local_path
-                    else:
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # 初始提交
+            while next_idx < len(url_items) and len(in_flight) < in_flight_max:
+                url, keys = url_items[next_idx]
+                sample = unique_products[keys[0]]
+                fut = executor.submit(self._download_single, url, sample, keys)
+                in_flight[fut] = (url, keys, sample)
+                next_idx += 1
+
+            while in_flight:
+                done = [f for f in in_flight if f.done()]
+                if not done:
+                    time.sleep(0.05)
+                    continue
+
+                for fut in done:
+                    url, keys, sample = in_flight.pop(fut)
+                    try:
+                        local_path = fut.result()
+                        if local_path:
+                            for key in keys: result[key] = local_path
+                            self.success_count += 1
+                            with self._cache_lock: self._url_path_cache[url] = local_path
+                        else:
+                            self.fail_count += 1
+                    except ImageDownloadError as e:
                         self.fail_count += 1
-                except ImageDownloadError as e:
-                    self.fail_count += 1
-                    with self._errors_lock:
-                        self.errors.append({
-                            "image_url": e.image_url,
-                            "error_type": e.error_type,
-                            "http_status": e.http_status,
-                            "error_detail": e.detail,
-                            "product_key": ", ".join(e.product_keys) if e.product_keys else "",
-                            "category": sample.get("category_name", ""),
-                            "page": sample.get("page_number", 0),
-                            "url": e.image_url,
-                        })
-                    logger.warning(f"图片下载失败 [{url[:80]}]: {e}")
-                except Exception as e:
-                    self.fail_count += 1
-                    with self._errors_lock:
-                        self.errors.append({
-                            "image_url": url,
-                            "error_type": type(e).__name__,
-                            "http_status": 0,
-                            "error_detail": str(e)[:500],
-                            "product_key": ", ".join(keys) if keys else "",
-                            "category": "",
-                            "page": 0,
-                            "url": url,
-                        })
-                    logger.warning(f"图片下载失败 [{url[:80]}]: {e}")
+                        with self._errors_lock:
+                            self.errors.append({
+                                "image_url": e.image_url, "error_type": e.error_type,
+                                "http_status": e.http_status, "error_detail": e.detail,
+                                "product_key": ", ".join(e.product_keys) if e.product_keys else "",
+                                "category": sample.get("category_name", ""),
+                                "page": sample.get("page_number", 0), "url": e.image_url,
+                            })
+                        if e.error_type not in ("TOO_SMALL", "HTML_RESPONSE", "UNKNOWN_FORMAT", "BLOCKED_PATTERN"):
+                            logger.warning(f"图片下载失败 [{url[:80]}]: {e}")
+                    except Exception as e:
+                        self.fail_count += 1
+                        with self._errors_lock:
+                            self.errors.append({
+                                "image_url": url, "error_type": type(e).__name__,
+                                "http_status": 0, "error_detail": str(e)[:500],
+                                "product_key": ", ".join(keys) if keys else "",
+                                "category": "", "page": 0, "url": url,
+                            })
+                        logger.warning(f"图片下载失败 [{url[:80]}]: {e}")
+
+                completed_since_last += len(done)
+                # 低频进度日志: 每30秒或每500张
+                now = time.time()
+                done_total = self.success_count + self.fail_count
+                if now - last_progress >= 30 or completed_since_last >= 500 or done_total >= total:
+                    rate = done_total / max(now - last_progress, 0.001) if last_progress > 0 else 0
+                    logger.info(f"图片进度: {done_total}/{total} "
+                                f"(成功{self.success_count} 失败{self.fail_count}) "
+                                f"速率: {rate:.0f}/秒")
+                    last_progress = now
+                    completed_since_last = 0
+
+                # 补充新任务
+                while next_idx < len(url_items) and len(in_flight) < in_flight_max:
+                    url, keys = url_items[next_idx]
+                    sample = unique_products[keys[0]]
+                    fut = executor.submit(self._download_single, url, sample, keys)
+                    in_flight[fut] = (url, keys, sample)
+                    next_idx += 1
 
         return result
 

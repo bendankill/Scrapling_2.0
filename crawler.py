@@ -55,8 +55,8 @@ class CategoryStats:
 
 
 class EmagCrawler:
-    def __init__(self, output_dir, image_downloader=None, page_workers=3,
-                 category_workers=2, max_in_flight=8, download_images=True,
+    def __init__(self, output_dir, image_downloader=None, page_workers=1,
+                 category_workers=1, max_in_flight=4, download_images=True,
                  all_pages=False, stop_event=None):
         self.output_dir = output_dir
         self.download_images = download_images
