@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
-"""eMAG 商品列表爬虫 V2.1.2 — 纯 HTTP"""
+"""eMAG 商品列表爬虫 V2.1.3 — 纯 HTTP"""
 import argparse, logging, os, signal, sys, threading, time
 from utils import (EXIT_SUCCESS, EXIT_CONFIG_ERROR, EXIT_NETWORK_ERROR,
     EXIT_CAPTCHA, EXIT_INTERRUPT, WafBlockError, RunStatus)
+from config import (DEFAULT_PAGE_WORKERS, DEFAULT_CATEGORY_WORKERS,
+    DEFAULT_MAX_IN_FLIGHT, DEFAULT_IMAGE_WORKERS)
 
 def parse_args():
-    p = argparse.ArgumentParser(description="eMAG 爬虫 V2.1.2")
+    p = argparse.ArgumentParser(description="eMAG 爬虫 V2.1.3")
     p.add_argument("--config", default=os.path.join(os.path.dirname(__file__), "config", "categories.txt"))
     pg = p.add_mutually_exclusive_group()
     pg.add_argument("--pages", type=int, default=1, help="最大抓取页数")
     pg.add_argument("--all-pages", action="store_true", help="最多20页/类目")
     p.add_argument("--no-images", action="store_true")
-    p.add_argument("--category-workers", type=int, default=2)
-    p.add_argument("--page-workers", type=int, default=3)
-    p.add_argument("--image-workers", type=int, default=8)
-    p.add_argument("--max-in-flight", type=int, default=16)
+    p.add_argument("--category-workers", type=int, default=DEFAULT_CATEGORY_WORKERS,
+                   help=f"类目并发数 (默认: {DEFAULT_CATEGORY_WORKERS})")
+    p.add_argument("--page-workers", type=int, default=DEFAULT_PAGE_WORKERS,
+                   help=f"页面并发数 (默认: {DEFAULT_PAGE_WORKERS})")
+    p.add_argument("--image-workers", type=int, default=DEFAULT_IMAGE_WORKERS,
+                   help=f"图片下载并发数 (默认: {DEFAULT_IMAGE_WORKERS})")
+    p.add_argument("--max-in-flight", type=int, default=DEFAULT_MAX_IN_FLIGHT,
+                   help=f"全局最大并发请求数 (默认: {DEFAULT_MAX_IN_FLIGHT})")
     p.add_argument("--output", default=None)
     p.add_argument("--log-level", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR"])
-    p.add_argument("--version", action="version", version="eMAG Crawler V2.1.2")
+    p.add_argument("--version", action="version", version="eMAG Crawler V2.1.3")
     return p.parse_args()
 
 def validate_positive(v, n):
@@ -28,11 +34,12 @@ def _fmt_duration(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:06.3f}（{seconds:.3f}秒）"
 
 def print_info(cats, max_pages, dl, args, out):
-    print(f"{'='*60}\n  eMAG V2.1.2 (纯HTTP)\n{'='*60}")
+    print(f"{'='*60}\n  eMAG V2.1.3 (纯HTTP)\n{'='*60}")
     for c in cats: print(f"    {c['name']}: {c['url']}")
     print(f"  页数: {'最多20' if max_pages is None else str(max_pages)}")
     print(f"  图片: {'否' if not dl else '是'}")
-    print(f"  并发: cat={args.category_workers} page={args.page_workers} img={args.image_workers} max={args.max_in_flight}")
+    print(f"  实际并发配置：page_workers={args.page_workers}, category_workers={args.category_workers}, "
+          f"image_workers={args.image_workers}, max_in_flight={args.max_in_flight}")
     print(f"  输出: {out}\n{'='*60}")
 
 def main():
@@ -48,8 +55,7 @@ def main():
     try: categories = load_txt_categories(args.config)
     except (FileNotFoundError, ValueError) as e:
         print(f"[错误] {e}", file=sys.stderr)
-        elapsed = time.perf_counter() - t_start
-        print(f"  本次任务总耗时：{_fmt_duration(elapsed)}")
+        print(f"  本次任务总耗时：{_fmt_duration(time.perf_counter() - t_start)}")
         return EXIT_CONFIG_ERROR
 
     max_pages = None if args.all_pages else args.pages
@@ -60,6 +66,7 @@ def main():
     from crawler import EmagCrawler; from image_downloader import ImageDownloader
     stop_ev = threading.Event()
     img_dl = ImageDownloader(out, max_workers=args.image_workers, max_in_flight=args.max_in_flight) if not args.no_images else None
+    # 构造函数默认值只在调用方没有传值时生效；程序正常从统一配置或CLI传入最终有效值
     crawler = EmagCrawler(out, image_downloader=img_dl, page_workers=args.page_workers,
         category_workers=args.category_workers, max_in_flight=args.max_in_flight,
         download_images=not args.no_images, all_pages=args.all_pages, stop_event=stop_ev)

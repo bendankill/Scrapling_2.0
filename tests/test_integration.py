@@ -135,11 +135,14 @@ class TestImageErrors:
         out=str(tmp_path/"o"); d=ImageDownloader(out,max_workers=1,max_in_flight=2,timeout=1)
         d.download_batch([self._mk("/img/s.jpg",srv)]); st=d.get_stats(); d.close()
         assert st["failed"]>=1
-    def test_small(self,srv,tmp_path):
-        srv.sr({"/img/t.jpg":(200,"image/jpeg","tiny")}); out=str(tmp_path/"o")
+    def test_small_valid_saved(self,srv,tmp_path):
+        """V2.1.3: 有效小图片应保存 (不再是TOO_SMALL失败)"""
+        # 构造一个最小的有效JPEG (魔数头+最小数据)
+        small_valid = "\xff\xd8\xff\xe0" + "\x00" * 100  # 104字节有效JPEG头
+        srv.sr({"/img/t.jpg":(200,"image/jpeg",small_valid)}); out=str(tmp_path/"o")
         d=ImageDownloader(out,max_workers=1,max_in_flight=2,timeout=5)
         d.download_batch([self._mk("/img/t.jpg",srv)]); st=d.get_stats(); d.close()
-        assert st["failed"]>=1
+        assert st["success"]>=1  # V2.1.3: 小但有效的图片应成功
     def test_html(self,srv,tmp_path):
         body="<html><body>"+"x"*2000+"</body></html>"
         srv.sr({"/img/f.jpg":(200,"text/html",body)}); out=str(tmp_path/"o")

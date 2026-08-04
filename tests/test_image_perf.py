@@ -191,11 +191,12 @@ class TestProgressLogging:
 # TOO_SMALL / 混合错误
 # ============================================================
 class TestMixedErrors:
-    def test_too_small_does_not_block(self, srv, tmp_path):
+    def test_invalid_img_does_not_block(self, srv, tmp_path):
+        """无效图片(UNKNOWN_FORMAT)失败后继续处理后续图片"""
         routes = {}
         for i in [0,1,2,4,5,6]:
             routes[f"/img/{i}.jpg"] = (200, "image/jpeg", VALID_JPEG)
-        routes["/img/3.jpg"] = (200, "image/jpeg", "tiny")
+        routes["/img/3.jpg"] = (200, "application/octet-stream", "\x00\x01\x02\x03" + "\x00" * 100)
         srv.sr(routes)
         prods = [{"pnk": f"P{i}","product_id": str(i),"main_image_url": srv.url(f"/img/{i}.jpg"),
                   "category_name":"T","page_number":1} for i in range(7)]
@@ -204,7 +205,7 @@ class TestMixedErrors:
         d.download_batch(prods); st = d.get_stats(); d.close()
         assert st["success"] == 6 and st["failed"] == 1
         assert len(st["errors"]) == 1
-        assert "TOO_SMALL" in st["errors"][0].get("error_type","")
+        assert "UNKNOWN_FORMAT" in st["errors"][0].get("error_type","")
 
     def test_mixed_errors_precise(self, srv, tmp_path):
         srv.sr({
@@ -212,22 +213,22 @@ class TestMixedErrors:
             "/img/ok2.jpg": (200, "image/jpeg", VALID_JPEG),
             "/img/nf.jpg": (404, "text/html", "NF"),
             "/img/html.jpg": (200, "text/html", "<html>"+"x"*2000+"</html>"),
-            "/img/tiny.jpg": (200, "image/jpeg", "x"),
+            "/img/bad.jpg": (200, "application/octet-stream", "\x00\x01\x02\x03"+"\x00"*100),
             "/img/ok3.jpg": (200, "image/jpeg", VALID_JPEG),
         })
         prods = []
-        for nm in ["ok1","ok2","nf","html","tiny","ok3"]:
+        for nm in ["ok1","ok2","nf","html","bad","ok3"]:
             prods.append({"pnk": nm,"product_id": nm,"main_image_url": srv.url(f"/img/{nm}.jpg"),
                          "category_name":"T","page_number":1})
         out = str(tmp_path / "o")
         d = ImageDownloader(out, max_workers=3, max_in_flight=6, timeout=5)
         d.download_batch(prods); st = d.get_stats(); d.close()
-        assert st["success"] == 3
-        assert st["failed"] == 3
+        assert st["success"] == 3  # ok1, ok2, ok3
+        assert st["failed"] == 3   # 404, HTML, bad format
         err_types = {e["error_type"] for e in st["errors"]}
         assert "HTTP_404" in err_types
         assert "HTML_RESPONSE" in err_types
-        assert "TOO_SMALL" in err_types
+        assert "UNKNOWN_FORMAT" in err_types
 
     def test_timeout_triggers_warning(self, srv, tmp_path, caplog):
         srv.sr({"/img/slow.jpg": (200, "image/jpeg", VALID_JPEG)})
@@ -272,18 +273,17 @@ class TestMultiBackfill:
 # errors.csv 集成 (通过Crawler finalize流程)
 # ============================================================
 class TestErrorsCsvIntegration:
-    def test_too_small_in_errors_csv(self, srv, tmp_path):
-        """Crawler._log_image_errors 将 TOO_SMALL 写入 errors.csv"""
+    def test_image_error_in_errors_csv(self, srv, tmp_path):
+        """Crawler._log_image_errors 将图片错误写入 errors.csv"""
         from crawler import EmagCrawler
-        from utils import ensure_errors_csv
         routes = {}
         for i in range(5): routes[f"/img/{i}.jpg"] = (200, "image/jpeg", VALID_JPEG)
-        routes["/img/tiny.jpg"] = (200, "image/jpeg", "tiny")
+        routes["/img/bad.jpg"] = (200, "application/octet-stream", "\x00\x01\x02\x03"+"\x00"*100)
         srv.sr(routes)
         out = str(tmp_path / "o")
         prods = [{"pnk": f"P{i}","product_id": str(i),"main_image_url": srv.url(f"/img/{i}.jpg"),
                   "category_name":"T","page_number":1} for i in range(5)]
-        prods.append({"pnk":"TINY","product_id":"99","main_image_url":srv.url("/img/tiny.jpg"),
+        prods.append({"pnk":"BAD","product_id":"99","main_image_url":srv.url("/img/bad.jpg"),
                       "category_name":"T","page_number":1})
         d = ImageDownloader(out, max_workers=2, max_in_flight=4, timeout=5)
         c = EmagCrawler(out, image_downloader=d, download_images=True,
@@ -291,14 +291,11 @@ class TestErrorsCsvIntegration:
         d.download_batch(prods)
         img_st = d.get_stats()
         assert len(img_st["errors"]) >= 1
-        # 验证内存中有 TOO_SMALL
-        assert any("TOO_SMALL" in e.get("error_type","") for e in img_st["errors"])
-        # 通过 Crawler 写入 errors.csv
         if img_st.get("errors"): c._log_image_errors(img_st)
         err_path = os.path.join(out, "errors.csv")
         assert os.path.exists(err_path)
         with open(err_path, encoding="utf-8-sig") as f: content = f.read()
-        assert "TOO_SMALL" in content
+        assert "UNKNOWN_FORMAT" in content
 
 # ============================================================
 # 快速任务: wait(FIRST_COMPLETED) 不引入轮询延迟
@@ -320,3 +317,104 @@ class TestFastScheduling:
         assert st["success"] == n
         # 200个任务在8线程下应在合理时间内完成; 如果有固定轮询, 耗时会长很多
         assert elapsed < 15, f"200 tasks took {elapsed:.1f}s (possible polling delay)"
+
+# ============================================================
+# PNK 命名测试
+# ============================================================
+class TestPnkNaming:
+    def test_pnk_used_as_filename(self, srv, tmp_path):
+        srv.sr({"/img/x.jpg": (200, "image/jpeg", VALID_JPEG)})
+        out = str(tmp_path / "o")
+        d = ImageDownloader(out, max_workers=1, max_in_flight=2, timeout=5)
+        prod = {"pnk": "DXYZ123ABC", "product_id": "1", "main_image_url": srv.url("/img/x.jpg"),
+                "category_name": "T", "page_number": 1}
+        r = d.download_batch([prod]); st = d.get_stats(); d.close()
+        assert st["success"] == 1
+        # 文件应以PNK命名 (在 images/ 子目录)
+        img_dir = os.path.join(out, "images")
+        files = os.listdir(img_dir)
+        assert any(f.startswith("DXYZ123ABC") for f in files)
+
+    def test_pnk_safe_chars(self, srv, tmp_path):
+        """非法字符替换为_"""
+        srv.sr({"/img/x.jpg": (200, "image/jpeg", VALID_JPEG)})
+        out = str(tmp_path / "o")
+        d = ImageDownloader(out, max_workers=1, max_in_flight=2, timeout=5)
+        prod = {"pnk": "A:B*C?D", "product_id": "1", "main_image_url": srv.url("/img/x.jpg"),
+                "category_name": "T", "page_number": 1}
+        d.download_batch([prod]); d.close()
+        img_dir = os.path.join(out, "images")
+        files = os.listdir(img_dir)
+        assert any("A_B_C_D" in f for f in files)
+
+    def test_no_pnk_fallback(self, srv, tmp_path):
+        """缺少PNK使用NO_PNK_兜底"""
+        srv.sr({"/img/x.jpg": (200, "image/jpeg", VALID_JPEG)})
+        out = str(tmp_path / "o")
+        d = ImageDownloader(out, max_workers=1, max_in_flight=2, timeout=5)
+        prod = {"pnk": "", "product_id": "12345", "main_image_url": srv.url("/img/x.jpg"),
+                "category_name": "T", "page_number": 1}
+        d.download_batch([prod]); d.close()
+        img_dir = os.path.join(out, "images")
+        files = os.listdir(img_dir)
+        assert any("NO_PNK" in f for f in files)
+
+    def test_same_url_one_download(self, srv, tmp_path):
+        """同URL只下载一次, 不同PNK各得路径"""
+        srv.sr({"/img/shared.jpg": (200, "image/jpeg", VALID_JPEG)})
+        u = srv.url("/img/shared.jpg")
+        out = str(tmp_path / "o")
+        d = ImageDownloader(out, max_workers=2, max_in_flight=4, timeout=5)
+        prods = [{"pnk": "PNK_A", "product_id": "1", "main_image_url": u, "category_name": "T"},
+                 {"pnk": "PNK_B", "product_id": "2", "main_image_url": u, "category_name": "T"}]
+        r = d.download_batch(prods); st = d.get_stats(); d.close()
+        assert st["success"] == 1  # 只下载一次
+        assert "pnk:PNK_A" in r and "pnk:PNK_B" in r
+
+    def test_pnk_conflict_suffix(self, srv, tmp_path):
+        """同PNK不同URL: 第二张加后缀_2"""
+        srv.sr({"/img/a.jpg": (200, "image/jpeg", VALID_JPEG),
+                "/img/b.jpg": (200, "image/jpeg", "\xff\xd8\xff\xe1" + "\x00" * 200)})
+        out = str(tmp_path / "o")
+        d = ImageDownloader(out, max_workers=1, max_in_flight=2, timeout=5)
+        prods = [{"pnk": "SAME", "product_id": "1", "main_image_url": srv.url("/img/a.jpg"), "category_name": "T"},
+                 {"pnk": "SAME", "product_id": "2", "main_image_url": srv.url("/img/b.jpg"), "category_name": "T"}]
+        d.download_batch(prods); d.close()
+        img_dir = os.path.join(out, "images")
+        files = os.listdir(img_dir)
+        has_same = any(f.startswith("SAME") and ".jp" in f and "_2" not in f for f in files)
+        has_conflict = any("SAME_2" in f for f in files)
+        assert has_same, f"Files: {files}"
+        assert has_conflict, f"Files: {files}"
+
+    def test_valid_small_saved(self, srv, tmp_path):
+        """V2.1.3: 有效小图片正常保存, 不失败"""
+        small_jpeg = "\xff\xd8\xff\xe0" + "\x00" * 100
+        srv.sr({"/img/small.jpg": (200, "image/jpeg", small_jpeg)})
+        out = str(tmp_path / "o")
+        d = ImageDownloader(out, max_workers=1, max_in_flight=2, timeout=5)
+        prod = {"pnk": "SMALL1", "product_id": "1", "main_image_url": srv.url("/img/small.jpg"),
+                "category_name": "T", "page_number": 1}
+        r = d.download_batch([prod]); st = d.get_stats(); d.close()
+        assert st["success"] == 1 and st["failed"] == 0
+
+# ============================================================
+# 配置默认值测试
+# ============================================================
+class TestConfigDefaults:
+    def test_defaults_are_1_1_4(self):
+        from config import DEFAULT_PAGE_WORKERS, DEFAULT_CATEGORY_WORKERS, DEFAULT_MAX_IN_FLIGHT
+        assert DEFAULT_PAGE_WORKERS == 1
+        assert DEFAULT_CATEGORY_WORKERS == 1
+        assert DEFAULT_MAX_IN_FLIGHT == 4
+
+    def test_cli_defaults_match_config(self):
+        """main.py CLI参数默认值与config.py一致"""
+        import main
+        args = main.parse_args()
+        from config import (DEFAULT_PAGE_WORKERS, DEFAULT_CATEGORY_WORKERS,
+                           DEFAULT_MAX_IN_FLIGHT, DEFAULT_IMAGE_WORKERS)
+        assert args.page_workers == DEFAULT_PAGE_WORKERS
+        assert args.category_workers == DEFAULT_CATEGORY_WORKERS
+        assert args.max_in_flight == DEFAULT_MAX_IN_FLIGHT
+        assert args.image_workers == DEFAULT_IMAGE_WORKERS
