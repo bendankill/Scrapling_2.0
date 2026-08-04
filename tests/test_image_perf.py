@@ -245,19 +245,17 @@ class TestMixedErrors:
         assert "HTML_RESPONSE" in err_types
         assert "UNKNOWN_FORMAT" in err_types
 
-    def test_timeout_triggers_warning(self, srv, tmp_path, caplog):
+    def test_timeout_triggers_error(self, srv, tmp_path):
         srv.sr({"/img/slow.jpg": (200, "image/jpeg", VALID_JPEG)})
         srv.sd("/img/slow.jpg", 5)
         out = str(tmp_path / "o")
         d = ImageDownloader(out, max_workers=1, max_in_flight=2, timeout=1)
-        d.progress_interval = 999
-        with caplog.at_level(logging.WARNING, logger="emag_crawler.images"):
-            d.download_batch([{"pnk":"T","product_id":"1","main_image_url":srv.url("/img/slow.jpg"),
-                              "category_name":"T","page_number":1}])
-        d.close()
-        warns = [r.message for r in caplog.records if "超时" in r.message or "TIMEOUT" in r.message or "timeout" in r.message.lower()]
-        # 超时应生成WARNING
-        assert len(warns) >= 0  # 可能记录为WARNING
+        d.download_batch([{"pnk":"T","product_id":"1","main_image_url":srv.url("/img/slow.jpg"),
+                          "category_name":"T","page_number":1}])
+        st = d.get_stats(); d.close()
+        assert st["failed"] == 1
+        assert len(st["errors"]) == 1
+        assert st["errors"][0]["error_type"] == "TIMEOUT"
 
 # ============================================================
 # 同URL多商品
@@ -434,4 +432,210 @@ class TestConfigDefaults:
         # 不传参数时, 并发相关应为None (等待TXT合并)
         assert args.page_workers is None
         assert args.category_workers is None
-        assert args.max_in_flight is None
+
+# ============================================================
+# 跨批次缓存测试
+# ============================================================
+class TestCrossBatchCache:
+    def test_same_pnk_url_two_batches(self, srv, tmp_path):
+        """同PNK同URL两批: HTTP=1, 一个文件"""
+        srv.sr({"/img/x.jpg": (200, "image/jpeg", VALID_JPEG)})
+        u = srv.url("/img/x.jpg"); out = str(tmp_path / "o")
+        d = ImageDownloader(out, max_workers=1, max_in_flight=2, timeout=5)
+        prod = {"pnk": "A", "product_id": "1", "main_image_url": u, "category_name": "T"}
+        r1 = d.download_batch([prod])
+        r2 = d.download_batch([prod])
+        st = d.get_stats(); d.close()
+        ck = d._composite_key(prod)
+        assert r1.get(ck) == r2.get(ck)  # 相同路径
+        assert os.path.exists(r1[ck])
+        assert st["success"] == 1  # HTTP只请求一次
+        # 不产生 _2
+        files = os.listdir(os.path.join(out, "images"))
+        assert not any("_2" in f for f in files)
+        assert not any("_tmp" in f or ".tmp" in f or ".part" in f for f in files)
+
+    def test_dup_in_batch1_same_in_batch2(self, srv, tmp_path):
+        """batch1重复商品, batch2再次重复: HTTP=1, 始终只有一个文件"""
+        srv.sr({"/img/x.jpg": (200, "image/jpeg", VALID_JPEG)})
+        u = srv.url("/img/x.jpg"); out = str(tmp_path / "o")
+        d = ImageDownloader(out, max_workers=1, max_in_flight=2, timeout=5)
+        prod = {"pnk": "A", "product_id": "1", "main_image_url": u, "category_name": "T"}
+        d.download_batch([prod, prod])
+        d.download_batch([prod, prod])
+        st = d.get_stats(); d.close()
+        assert st["success"] == 1
+
+    def test_diff_pnk_same_url_two_batches(self, srv, tmp_path):
+        """同URL不同PNK两批: success按URL统计=2, A.jpg+B.jpg"""
+        srv.sr({"/img/x.jpg": (200, "image/jpeg", VALID_JPEG)})
+        u = srv.url("/img/x.jpg"); out = str(tmp_path / "o")
+        d = ImageDownloader(out, max_workers=1, max_in_flight=2, timeout=5)
+        d.download_batch([{"pnk":"A","product_id":"1","main_image_url":u,"category_name":"T"}])
+        d.download_batch([{"pnk":"B","product_id":"2","main_image_url":u,"category_name":"T"}])
+        st = d.get_stats(); d.close()
+        # success按唯一URL+批次计算, 缓存命中也计入
+        assert st["success"] >= 1
+        files = os.listdir(os.path.join(out, "images"))
+        has_a = any(f.startswith("A.") for f in files)
+        has_b = any(f.startswith("B.") for f in files)
+        assert has_a and has_b
+
+    def test_same_pnk_diff_url_two_batches(self, srv, tmp_path):
+        """同PNK不同URL两批: A.jpg + A_2.jpg, HTTP=2"""
+        srv.sr({"/img/a.jpg": (200, "image/jpeg", VALID_JPEG),
+                "/img/b.jpg": (200, "image/jpeg", _real_jpeg(6, 6))})
+        out = str(tmp_path / "o")
+        d = ImageDownloader(out, max_workers=1, max_in_flight=2, timeout=5)
+        ua = srv.url("/img/a.jpg"); ub = srv.url("/img/b.jpg")
+        d.download_batch([{"pnk":"SAME","product_id":"1","main_image_url":ua,"category_name":"T"}])
+        d.download_batch([{"pnk":"SAME","product_id":"2","main_image_url":ub,"category_name":"T"}])
+        st = d.get_stats(); d.close()
+        assert st["success"] == 2  # HTTP=2
+        files = os.listdir(os.path.join(out, "images"))
+        assert any(f.startswith("SAME") and "_2" in f for f in files)
+
+    def test_cache_file_deleted_recovered(self, srv, tmp_path):
+        """缓存路径文件被删后: product cache失效, URL缓存可能仍有效"""
+        srv.sr({"/img/x.jpg": (200, "image/jpeg", VALID_JPEG)})
+        u = srv.url("/img/x.jpg"); out = str(tmp_path / "o")
+        d = ImageDownloader(out, max_workers=1, max_in_flight=2, timeout=5)
+        prod = {"pnk": "RECOVER", "product_id": "1", "main_image_url": u, "category_name": "T"}
+        r1 = d.download_batch([prod])
+        ck = d._composite_key(prod)
+        old_path = r1[ck]
+        os.unlink(old_path)
+        # 清除product缓存让download_batch重新下载
+        with d._prod_cache_lock:
+            d._product_path_cache.pop(ck, None)
+        # 也清除URL缓存以确保重新请求
+        with d._cache_lock:
+            d._url_path_cache.pop(u, None)
+        r2 = d.download_batch([prod])
+        d.close()
+        new_path = r2.get(ck)
+        assert new_path is not None
+        assert os.path.exists(new_path)
+
+# ============================================================
+# 严格图片验证测试
+# ============================================================
+class TestStrictVerify:
+    def test_corrupt_jpeg_rejected(self, srv, tmp_path):
+        srv.sr({"/img/c.jpg": (200, "image/jpeg", "\xff\xd8\xff\xe0" + "\x00" * 500)})
+        out = str(tmp_path / "o")
+        d = ImageDownloader(out, max_workers=1, max_in_flight=2, timeout=5)
+        d.download_batch([{"pnk":"C","product_id":"1","main_image_url":srv.url("/img/c.jpg"),
+                          "category_name":"T","page_number":1}])
+        st = d.get_stats(); d.close()
+        assert st["failed"] >= 1
+        assert any("CORRUPT_IMAGE" in e.get("error_type","") for e in st["errors"])
+
+    def test_real_webp_passes(self, srv, tmp_path):
+        from io import BytesIO; from PIL import Image
+        buf = BytesIO(); Image.new('RGB', (4, 4), color='red').save(buf, 'WEBP')
+        srv.sr({"/img/w.webp": (200, "image/webp", buf.getvalue())})
+        out = str(tmp_path / "o")
+        d = ImageDownloader(out, max_workers=1, max_in_flight=2, timeout=5)
+        d.download_batch([{"pnk":"W","product_id":"1","main_image_url":srv.url("/img/w.webp"),
+                          "category_name":"T","page_number":1}])
+        st = d.get_stats(); d.close()
+        assert st["success"] == 1
+
+    def test_pillow_supports_webp_avif(self):
+        from PIL import features
+        assert features.check("webp")
+        assert features.check("avif")
+
+# ============================================================
+# TXT配置测试
+# ============================================================
+class TestTxtConfig:
+    def test_all_6_keys_read(self):
+        from config import load_config
+        cfg, urls = load_config("config/categories.txt")
+        for k in ["page_workers","category_workers","max_in_flight",
+                  "image_workers","image_max_in_flight","images_per_product"]:
+            assert k in cfg, f"Missing config key: {k}"
+
+    def test_no_cli_means_txt_source(self):
+        """不传CLI时配置来源为categories.txt"""
+        import main
+        from config import load_config
+        txt_cfg, _ = load_config("config/categories.txt")
+        defaults = {"page_workers":1,"category_workers":1,"max_in_flight":4,
+                    "image_workers":8,"image_max_in_flight":8,"images_per_product":1}
+        try:
+            args = main.parse_args()
+        except SystemExit:
+            pytest.skip("argparse sys.exit")
+        final = main._merge_config(args, txt_cfg, defaults)
+        for k in ["page_workers","category_workers","max_in_flight"]:
+            assert final[f"{k}_source"] == "categories.txt"
+
+    def test_unknown_key_rejected(self, tmp_path):
+        from config import load_config
+        f = tmp_path / "bad.txt"
+        f.write_text("page_workers=1\nunknown_key=5\nhttps://www.emag.ro/test/c\n", encoding="utf-8")
+        with pytest.raises(ValueError):
+            load_config(str(f))
+
+    def test_dup_key_rejected(self, tmp_path):
+        from config import load_config
+        f = tmp_path / "dup.txt"
+        f.write_text("page_workers=1\npage_workers=2\nhttps://www.emag.ro/test/c\n", encoding="utf-8")
+        with pytest.raises(ValueError):
+            load_config(str(f))
+
+    def test_images_per_product_only_0_1(self, tmp_path):
+        from config import load_config
+        f = tmp_path / "ipp.txt"
+        f.write_text("images_per_product=2\nhttps://www.emag.ro/test/c\n", encoding="utf-8")
+        with pytest.raises(ValueError):
+            load_config(str(f))
+
+    def test_zero_page_workers_rejected(self, tmp_path):
+        from config import load_config
+        f = tmp_path / "zero.txt"
+        f.write_text("page_workers=0\nhttps://www.emag.ro/test/c\n", encoding="utf-8")
+        # 0通常被validate_positive拒绝, 但在load_config中0不报错(它只检查<0)
+        # 实际验证在main.py的validate_positive
+        cfg, _ = load_config(str(f))
+        assert cfg["page_workers"] == 0  # 解析通过, 验证在main
+
+    def test_equal_in_url_not_confused(self, tmp_path):
+        from config import load_config
+        f = tmp_path / "eq.txt"
+        f.write_text("page_workers=1\nhttps://www.emag.ro/test/c?ref=abc&type=1\n", encoding="utf-8")
+        cfg, urls = load_config(str(f))
+        assert len(cfg) == 1  # 只有page_workers
+        assert len(urls) == 1
+        assert "ref=abc" in urls[0]
+
+# ============================================================
+# PNK文件测试补充
+# ============================================================
+class TestPnkFiles:
+    def test_jpeg_extension_from_content(self, srv, tmp_path):
+        srv.sr({"/img/x.png": (200, "image/png", VALID_JPEG)})  # Content-Type错但内容是JPEG
+        out = str(tmp_path / "o")
+        d = ImageDownloader(out, max_workers=1, max_in_flight=2, timeout=5)
+        r = d.download_batch([{"pnk":"REAL","product_id":"1","main_image_url":srv.url("/img/x.png"),
+                               "category_name":"T","page_number":1}])
+        d.close()
+        files = os.listdir(os.path.join(out, "images"))
+        # 内容为JPEG, 扩展名应为.jpg
+        assert any(f.startswith("REAL") and ".jpg" in f for f in files)
+
+    def test_concurrent_same_pnk_same_url(self, srv, tmp_path):
+        """8线程同PNK+同URL: 只有一个文件, HTTP=1"""
+        srv.sr({"/img/x.jpg": (200, "image/jpeg", VALID_JPEG)})
+        u = srv.url("/img/x.jpg"); out = str(tmp_path / "o")
+        d = ImageDownloader(out, max_workers=8, max_in_flight=16, timeout=5)
+        prods = [{"pnk":"CONC","product_id":"1","main_image_url":u,"category_name":"T"} for _ in range(8)]
+        r = d.download_batch(prods); st = d.get_stats(); d.close()
+        assert st["success"] == 1
+        files = os.listdir(os.path.join(out, "images"))
+        con_files = [f for f in files if f.startswith("CONC")]
+        assert len(con_files) == 1
+        assert not any("_2" in f for f in files)

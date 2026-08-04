@@ -83,7 +83,10 @@ class ImageDownloader:
         self.semaphore = global_semaphore or Semaphore(max_in_flight)
         self.timeout = timeout
         self._cache_lock = Lock()
-        self._url_path_cache: dict[str, str] = {}  # URL → first_local_path
+        self._url_path_cache: dict[str, str] = {}  # URL → (first_local_path, ext)
+        # 商品路径缓存: composite_key → final_path (跨批次复用)
+        self._product_path_cache: dict[str, str] = {}
+        self._prod_cache_lock = Lock()
         # 线程安全: 已预留文件名集合 + PNK计数
         self._reserved_names: set = set()
         self._pnk_count: dict[str, int] = {}
@@ -100,18 +103,29 @@ class ImageDownloader:
     def download_batch(self, products: list[dict]) -> dict[str, str]:
         # 按URL分组: url → [{product_dict}, ...]
         url_to_prods: dict[str, list[dict]] = {}
+        result: dict[str, str] = {}  # composite_key → local_path
         for p in products:
             img_url = (p.get("main_image_url") or "").strip()
             key = get_product_key(p)
             if not img_url or not key: continue
+            ck = self._composite_key(p)
+            # 检查商品路径缓存: 跨批次复用
+            with self._prod_cache_lock:
+                if ck in self._product_path_cache:
+                    cached_path = self._product_path_cache[ck]
+                    if os.path.exists(cached_path):
+                        result[ck] = cached_path
+                        continue
             if img_url not in url_to_prods: url_to_prods[img_url] = []
             url_to_prods[img_url].append(p)
 
         total = len(url_to_prods)
-        unique_prod_count = sum(len(v) for v in url_to_prods.values())
+        unique_prod_count = sum(len(v) for v in url_to_prods.values()) + len(result)
+        if total == 0 and result:
+            logger.info(f"全部 {len(result)} 个商品图片已缓存，无需下载")
+            return result
         logger.info(f"准备下载 {total} 个唯一URL (对应 {unique_prod_count} 个商品)")
 
-        result: dict[str, str] = {}  # composite_key → local_path
         url_items = list(url_to_prods.items())
         in_flight_limit = max(1, min(self.max_in_flight, self.max_workers * 2))
         in_flight: dict = {}; next_idx = 0
@@ -213,6 +227,11 @@ class ImageDownloader:
                         continue
                     self._link_or_copy(first_path, pnk_path)
                     if os.path.exists(pnk_path): result[ck] = pnk_path
+                # 写入商品路径缓存
+                with self._prod_cache_lock:
+                    for ck, path in result.items():
+                        if os.path.exists(path):
+                            self._product_path_cache[ck] = path
                 return result
 
         with self.semaphore:
@@ -287,10 +306,15 @@ class ImageDownloader:
                 if os.path.exists(pnk_path):
                     result[ck] = pnk_path
 
-        # 缓存: 保存 (path, ext)
+        # 缓存: 保存URL缓存 + 商品路径缓存
         if first_path:
             with self._cache_lock:
                 self._url_path_cache[url] = (first_path, detected_ext)
+        # 将成功路径写入商品路径缓存 (跨批次复用)
+        with self._prod_cache_lock:
+            for ck, path in result.items():
+                if os.path.exists(path):
+                    self._product_path_cache[ck] = path
         return result
 
     def _make_pnk_basename(self, product: dict) -> str:
