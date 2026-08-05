@@ -1,10 +1,51 @@
 # 更新日志
 
+## V2.1.3 (2026-08-05)
+
+### 新增
+- **图片PNK命名**: 下载图片使用商品PNK码命名 (`{PNK}.{ext}`)
+- **同URL多PNK**: 相同图片URL对应多个商品时，每个PNK生成独立文件(硬链接优先)
+- **TXT运行配置**: `config/categories.txt` 顶部支持6项运行参数，CLI参数可覆盖
+- **类目数量日志**: 任务开始和结束时打印实际抓取类目数量
+- **真实图片验证**: 使用Pillow `Image.verify()` 严格验证JPEG/PNG/WebP/AVIF
+- **有效小图片**: 移除固定1024字节限制，格式有效的图片均可保存
+- **跨批次缓存**: 相同PNK+URL的图片跨批次复用，不重复生成文件
+- **统一URL去重**: `_normalize_cat_url()` 识别同路径不同查询参数的重复URL
+
+### 修复
+- **并发默认值统一**: 新建 `config.py`，CLI默认值从统一配置读取
+- **线程安全PNK命名**: `_reserved_names` + `_name_lock` 防止并发冲突
+- **原子文件写入**: `mkstemp` + `os.replace` 防止半成品文件
+- **Pillow严格验证**: 删除 `except Exception: return True`，WebP/AVIF全体严格验证
+- **缓存扩展名修复**: 缓存存储 `(path, ext)` 元组，修复 `_tmp` 文件名问题
+- **空断言修复**: 超时测试改为真实断言 `failed==1, error_type==TIMEOUT`
+
+### 测试
+- 157项测试 (从152项增长)
+- 跨批次缓存、严格验证、TXT配置、PNK文件、类目数量专项测试
+
+## V2.1.2 (2026-08-04)
+
+### 新增
+- **任务总耗时**: 所有退出场景打印 `HH:MM:SS.mmm` 格式耗时
+- **有界图片Future**: `wait(FIRST_COMPLETED)` 替代50ms轮询
+- **60秒进度日志**: 低频图片下载进度，不逐张打印
+
+### 删除
+- **断点续抓**: 删除 `checkpoint.py`、`--resume`、`resume.bat`、`CheckpointManager`
+
+## V2.1.1 (2026-08-03)
+
+### 新增
+- **断点续抓**: CheckpointManager、页面快照、`--resume` 恢复
+- **PageResult统计**: cards_found/products_parsed/parse_failed/duplicates/new_unique
+- **Ctrl+C安全中断**: signal handler，退出码130，checkpoint保存
+
 ## V2.1.0 (2026-08-03)
 
 ### 版本标记
 - 累计修订 V2.0.0 → V2.0.1 → V2.0.2 → V2.0.3 → **V2.1.0**
-- 此版本整合了 V2.0.x 全部修复，作为首个生产可用稳定版标记
+- 整合 V2.0.x 全部修复，首个生产可用稳定版标记
 
 ### 当前能力摘要
 - **纯 HTTP 抓取**: Scrapling FetcherSession（无浏览器）
@@ -16,31 +57,3 @@
 - **图片**: 主图下载、魔数检测 (JPEG/PNG/WebP/AVIF)、同 URL 多商品回填、错误追踪
 - **配置**: `categories.txt` 每行一个 URL，`urllib.parse` 校验
 - **退出码**: 0=成功, 1=参数错误, 2=网络错误, 3=WAF阻断, 130=中断
-
-### 依赖
-- `scrapling[fetchers]==0.4.12` (传递安装 playwright Python 包, 不启动浏览器)
-- `beautifulsoup4`, `lxml`, `openpyxl`, `httpx`, `pytest`
-- `patchright` 安装后自动卸载
-
-## V2.0.3 (2026-08-03)
-- 按页码顺序缓冲提交（并发乱序数据不丢失）
-- `--all-pages` 固定 20 页
-- 真正 Session 复用（`__enter__()` 一次，后续复用）
-- 图片错误写入 `errors.csv`
-- 动态端口测试服务器
-
-## V2.0.2 (2026-08-03)
-- 依赖冲突修复 (lxml>=6.1.1)
-- 403/429/511 无条件 WAF 阻断
-- 有界并发分页
-- 跨类目去重隔离
-- `threading.local()` Session 管理
-
-## V2.0.1 (2026-08-03)
-- 纯 HTTP 模式 (删除 StealthyFetcher/Playwright/Chromium)
-- `categories.txt` 替代 `categories.json`
-- `products.json` 替代 `products.jsonl`
-- WAF 检测和退出码规范
-
-## V2.0.0 MVP (2026-08-03)
-- 初始版本，基于 Scrapling 0.4.12
