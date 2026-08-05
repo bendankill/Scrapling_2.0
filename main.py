@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""eMAG 商品列表爬虫 V2.1.3 — 纯 HTTP + TXT配置"""
+"""eMAG 商品列表爬虫 V2.1.4 — 纯 HTTP + TXT配置"""
 import argparse, logging, os, signal, sys, threading, time
 from utils import (EXIT_SUCCESS, EXIT_CONFIG_ERROR, EXIT_NETWORK_ERROR,
     EXIT_CAPTCHA, EXIT_INTERRUPT, WafBlockError, RunStatus)
@@ -8,7 +8,7 @@ from config import (DEFAULT_PAGE_WORKERS, DEFAULT_CATEGORY_WORKERS,
     DEFAULT_IMAGES_PER_PRODUCT, load_config)
 
 def parse_args():
-    p = argparse.ArgumentParser(description="eMAG 爬虫 V2.1.3")
+    p = argparse.ArgumentParser(description="eMAG 爬虫 V2.1.4")
     p.add_argument("--config", default=os.path.join(os.path.dirname(__file__), "config", "categories.txt"))
     pg = p.add_mutually_exclusive_group()
     pg.add_argument("--pages", type=int, default=1, help="最大抓取页数")
@@ -23,7 +23,7 @@ def parse_args():
     p.add_argument("--images-per-product", type=int, default=None, choices=[0,1])
     p.add_argument("--output", default=None)
     p.add_argument("--log-level", default="INFO", choices=["DEBUG","INFO","WARNING","ERROR"])
-    p.add_argument("--version", action="version", version="eMAG Crawler V2.1.3")
+    p.add_argument("--version", action="version", version="eMAG Crawler V2.1.4")
     return p.parse_args()
 
 def validate_positive(v, n):
@@ -109,7 +109,7 @@ def main():
 
     # 启动信息
     dl_images = (not args.no_images) and (final["images_per_product"] >= 1)
-    print(f"{'='*60}\n  eMAG V2.1.3 (纯HTTP)\n{'='*60}")
+    print(f"{'='*60}\n  eMAG V2.1.4 (纯HTTP)\n{'='*60}")
     print(f"  本次抓取类目数量：{cat_count}")
     for c in categories: print(f"    {c['name']}: {c['url']}")
     print(f"  页数: {'最多20' if max_pages is None else str(max_pages)}")
@@ -142,8 +142,10 @@ def main():
     tot = summary.get("totals", {})
 
     elapsed = time.perf_counter() - t_start
+    completed = tot.get('completed_categories', 0)
+    target = tot.get('target_categories', cat_count)
     print(f"\n{'='*60}\n  任务结束 (退出码: {ec})\n{'='*60}")
-    print(f"  本次抓取类目数量：{cat_count}")
+    print(f"  本次抓取类目实际完成/目标数量：{completed}/{target}")
     print(f"  商品记录/唯一: {tot.get('total_records',0)}/{tot.get('unique_products',0)}")
     print(f"  成功/失败页: {tot.get('success_pages',0)}/{tot.get('failed_pages',0)}")
     print(f"  状态: {summary.get('status','')}")

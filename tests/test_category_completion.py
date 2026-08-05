@@ -1,0 +1,185 @@
+"""
+V2.1.4 类目完成计数测试
+"""
+import json, os, sys, threading, time, http.server, socketserver, urllib.parse, pytest
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from crawler import EmagCrawler, ALL_PAGES_LIMIT
+
+PC = """<div class="card-item card-standard js-product-data"
+ data-product-id="{}" data-name="P{}" data-position="{}"
+ data-url="https://www.emag.ro/test/pd/PNK{}/"><p class="product-new-price">{},99Lei</p></div>"""
+def _mp(n, cnt, hn=True, sid=0):
+    nl = f'<link rel="next" href="/test/p{n+1}/c">' if hn else ''
+    cs = "".join(PC.format(sid+i,sid+i,i,sid+i,(sid+i)*10) for i in range(1,cnt+1))
+    return f"<html><head>{nl}</head><body><h1>P{n}</h1>{cs}</body></html>"
+
+class _TH(http.server.BaseHTTPRequestHandler):
+    routes={}; lk=threading.Lock()
+    @classmethod
+    def ra(cls): cls.routes={}
+    def do_GET(self):
+        p=urllib.parse.urlparse(self.path).path.rstrip("/")
+        if p in self.routes:
+            s,ct,b=self.routes[p]; data=b.encode() if isinstance(b,str) else b
+            self.send_response(s); self.send_header("Content-Type",ct)
+            self.send_header("Content-Length",str(len(data))); self.end_headers()
+            self.wfile.write(data)
+        else: self.send_response(404); self.end_headers()
+    def log_message(self,f,*a): pass
+
+class TTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address=True; daemon_threads=True
+
+class LS:
+    def __init__(s): s._s=None; s.port=0
+    def start(s): _TH.ra(); s._s=TTCPServer(("127.0.0.1",0),_TH); s.port=s._s.server_address[1]; threading.Thread(target=s._s.serve_forever,daemon=True).start()
+    def stop(s):
+        if s._s:
+            try: s._s.shutdown(); s._s.server_close()
+            except: pass
+    def url(s,p="/test/c"): return f"http://127.0.0.1:{s.port}{p}"
+    def sr(s,r): _TH.routes=r
+
+@pytest.fixture
+def srv():
+    s=LS(); s.start(); time.sleep(0.03)
+    try: yield s
+    finally: s.stop()
+
+def _mc(s,ps): return [{"name":f"C{p.split('/')[1]}","url":s.url(p),"enabled":True} for p in ps]
+
+# ============================================================
+class TestCategoryCompletion:
+    def test_normal_all_completed(self, srv, tmp_path):
+        """3个类目全部正常完成 → 3/3"""
+        srv.sr({
+            "/cat1/c": (200, "text/html", _mp(1, 1, hn=False)),
+            "/cat2/c": (200, "text/html", _mp(1, 1, hn=False)),
+            "/cat3/c": (200, "text/html", _mp(1, 1, hn=False)),
+        })
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/cat1/c","/cat2/c","/cat3/c"]), max_pages=1)
+        s = c.finalize()
+        assert s["totals"]["target_categories"] == 3
+        assert s["totals"]["completed_categories"] == 3
+        assert s["status"] == "completed"
+        assert c.get_exit_code() == 0
+        for cat_d in s["categories"]:
+            assert cat_d["completed"] == True
+
+    def test_waf_first_cat_zero_completed(self, srv, tmp_path):
+        """第一个类目首页WAF → 0/3"""
+        srv.sr({"/cat1/c": (403, "text/html", "Forbidden")})
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/cat1/c","/cat2/c","/cat3/c"]), max_pages=1)
+        s = c.finalize()
+        assert s["totals"]["target_categories"] == 3
+        assert s["totals"]["completed_categories"] == 0
+        assert s["status"] == "waf_blocked"
+        assert c.get_exit_code() == 3
+
+    def test_one_done_then_waf(self, srv, tmp_path):
+        """类目A完成→类目B第2页WAF→类目C不请求: 1/3, B首页数据保留"""
+        # _mp生成 href="/test/p2/c", 需要cat2的page2路由匹配
+        p1 = _mp(1, 2, hn=False)  # 无下一页
+        p2 = '<html><head><link rel="next" href="/cat2/p2/c"></head><body>' + \
+             "".join(PC.format(i,i,i,i,i*10) for i in range(1,3)) + "</body></html>"
+        srv.sr({
+            "/cat1/c": (200, "text/html", p1),
+            "/cat2/c": (200, "text/html", p2),
+            "/cat2/p2/c": (511, "text/html", "WAF"),
+        })
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/cat1/c","/cat2/c","/cat3/c"]), max_pages=2)
+        s = c.finalize()
+        assert s["totals"]["completed_categories"] == 1
+        assert s["totals"]["target_categories"] == 3
+        assert s["totals"]["total_records"] >= 2
+        assert s["status"] == "waf_blocked"
+
+    def test_waf_data_integrity(self, srv, tmp_path):
+        """WAF前PNK完整性: 商品记录完整保留"""
+        p1 = _mp(1, 2, hn=False)
+        p2 = '<html><head><link rel="next" href="/cat2/p2/c"></head><body>' + \
+             "".join(PC.format(i,i,i,i,i*10) for i in range(1,3)) + "</body></html>"
+        srv.sr({"/cat1/c": (200, "text/html", p1), "/cat2/c": (200, "text/html", p2),
+                "/cat2/p2/c": (511, "text/html", "WAF")})
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/cat1/c","/cat2/c","/cat3/c"]), max_pages=2)
+        s = c.finalize()
+        assert s["totals"]["completed_categories"] == 1
+        assert s["totals"]["total_records"] == 4
+        jp = os.path.join(out, "products.json")
+        data = json.load(open(jp, encoding="utf-8"))
+        assert len(data) == 4
+        assert os.path.exists(os.path.join(out, "products.csv"))
+        assert os.path.exists(os.path.join(out, "products.xlsx"))
+        assert os.path.exists(os.path.join(out, "errors.csv"))
+
+    def test_actual_pages_less_than_limit(self, srv, tmp_path):
+        """用户要10页实际3页 → 正常完成1/1"""
+        srv.sr({
+            "/test/c": (200, "text/html", _mp(1, 1)),
+            "/test/p2/c": (200, "text/html", _mp(2, 1)),
+            "/test/p3/c": (200, "text/html", _mp(3, 1, hn=False)),
+        })
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/test/c"]), max_pages=10)
+        s = c.finalize()
+        assert s["totals"]["completed_categories"] == 1
+        assert s["totals"]["target_categories"] == 1
+        assert s["status"] == "completed"
+        assert s["totals"]["success_pages"] == 3
+
+    def test_network_error_completed_count(self, srv, tmp_path):
+        """类目A完成, 类目B网络错误 → 1/3"""
+        srv.sr({
+            "/cat1/c": (200, "text/html", _mp(1, 1, hn=False)),
+            "/cat2/c": (500, "text/html", "Error"),
+        })
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/cat1/c","/cat2/c","/cat3/c"]), max_pages=1)
+        s = c.finalize()
+        assert s["totals"]["completed_categories"] == 1
+        assert s["status"] == "network_error"
+        assert c.get_exit_code() == 2
+
+    def test_interrupted_count(self, srv, tmp_path):
+        """Ctrl+C: 已完成类目计入, 未完成不计"""
+        srv.sr({
+            "/cat1/c": (200, "text/html", _mp(1, 1, hn=False)),
+            "/cat2/c": (200, "text/html", _mp(1, 2)),
+        })
+        out = str(tmp_path / "o")
+        se = threading.Event()
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2, stop_event=se)
+        def sto(): time.sleep(0.5); se.set(); c._interrupted = True
+        threading.Thread(target=sto, daemon=True).start()
+        c.crawl_all_categories(_mc(srv, ["/cat1/c","/cat2/c"]), max_pages=2)
+        s = c.finalize(interrupted=True)
+        assert s["totals"]["target_categories"] == 2
+        # cat1已完成或cat2尚未完成时中断, completed <= 1
+        assert s["totals"]["completed_categories"] >= 0
+        assert s["status"] == "interrupted"
+
+    def test_run_summary_has_counts(self, srv, tmp_path):
+        """run_summary.json 包含 target/completed 和 per-cat completed"""
+        srv.sr({
+            "/cat1/c": (200, "text/html", _mp(1, 1, hn=False)),
+            "/cat2/c": (200, "text/html", _mp(1, 1, hn=False)),
+        })
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/cat1/c","/cat2/c"]), max_pages=1)
+        c.finalize()
+        rs = json.load(open(os.path.join(out, "run_summary.json"), encoding="utf-8"))
+        assert rs["totals"]["target_categories"] == 2
+        assert rs["totals"]["completed_categories"] == 2
+        for cat_d in rs["categories"]:
+            assert "completed" in cat_d

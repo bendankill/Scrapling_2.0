@@ -228,10 +228,11 @@ class EmagCrawler:
                     while next_expected in completed_buf and not stopped:
                         pr = completed_buf.pop(next_expected)
                         if pr.waf_error:
+                            stats.stop_reason = "waf_blocked"
                             self._handle_stop(RunStatus.WAF_BLOCKED, name, next_expected, pr.page_url, pr.waf_error)
                             self._stop_event.set(); stopped = True; break
                         if pr.http_status != 200:
-                            stats.failed_pages += 1
+                            stats.failed_pages += 1; stats.stop_reason = "network_error"
                             self._handle_stop(RunStatus.NETWORK_ERROR, name, next_expected, pr.page_url, detail=f"HTTP {pr.http_status}")
                             stopped = True; break
                         if pr.cards_found == 0: stopped = True; break
@@ -253,7 +254,8 @@ class EmagCrawler:
 
             for fut in list(in_flight.keys()): fut.cancel()
 
-        if not stats.stop_reason: stats.stop_reason = "requested_limit_reached"
+        if not stats.stop_reason:
+            stats.stop_reason = "requested_limit_reached"
         stats.end_time = time.time()
         return stats
 
@@ -294,10 +296,21 @@ class EmagCrawler:
     # ---- 类目调度 ----
     def crawl_all_categories(self, categories, max_pages=None):
         if not categories: return {}
+        self._target_cat_count = len(categories)
+        self._completed_cat_urls: set = set()
+        self._cat_urls_lock = Lock()
         for cat in categories:
             if self._stop_event.is_set(): break
             if self._run_status.is_stopped: break
             self.crawl_category(cat["name"], cat["url"], max_pages)
+            # 判断该类目是否正常完成
+            stats = self.stats.get(cat["name"])
+            if stats and stats.stop_reason in (
+                "requested_limit_reached", "actual_last_page_reached",
+                "no_next_page", "empty_category"
+            ):
+                with self._cat_urls_lock:
+                    self._completed_cat_urls.add(cat["url"])
             if self._run_status.is_stopped: break
         return {}
 
@@ -393,17 +406,29 @@ class EmagCrawler:
             self._run_status = RunStatus.COMPLETED
 
         status = self._run_status
+        target_cats = getattr(self, '_target_cat_count', 0)
+        completed_cats = len(getattr(self, '_completed_cat_urls', set()))
+        # 每个类目标记是否完成
+        cat_dicts = []
+        for s in self.stats.values():
+            d = s.to_dict()
+            d["completed"] = s.stop_reason in (
+                "requested_limit_reached", "actual_last_page_reached",
+                "no_next_page", "empty_category")
+            cat_dicts.append(d)
         summary = {
-            "version": "2.1.2", "status": status.value,
+            "version": "2.1.4", "status": status.value,
             "start_time": datetime.fromtimestamp(self.start_time, tz=timezone.utc).isoformat(),
             "end_time": datetime.now(timezone.utc).isoformat(),
             "elapsed_seconds": round(total_elapsed, 2),
-            "categories": [s.to_dict() for s in self.stats.values()],
+            "categories": cat_dicts,
             "totals": {"total_records": total_records, "unique_products": len(unique_keys),
                 "image_download_success": image_stats["success"],
                 "image_download_failed": image_stats["failed"],
                 "success_pages": sum(s.success_pages for s in self.stats.values()),
-                "failed_pages": sum(s.failed_pages for s in self.stats.values())},
+                "failed_pages": sum(s.failed_pages for s in self.stats.values()),
+                "target_categories": target_cats,
+                "completed_categories": completed_cats},
         }
         write_atomic_json(os.path.join(self.output_dir, "run_summary.json"), summary)
         return summary
