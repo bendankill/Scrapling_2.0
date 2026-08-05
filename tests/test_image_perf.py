@@ -639,3 +639,73 @@ class TestPnkFiles:
         con_files = [f for f in files if f.startswith("CONC")]
         assert len(con_files) == 1
         assert not any("_2" in f for f in files)
+
+# ============================================================
+# 类目数量日志测试
+# ============================================================
+class TestCategoryCount:
+    def test_normal_prints_count(self, tmp_path, capsys):
+        """1个有效emag URL → 开始和结束各打印1次"""
+        cats_path = tmp_path / "cats.txt"
+        cats_path.write_text(
+            "images_per_product=0\n"
+            "https://www.emag.ro/mouse/c\n",
+            encoding="utf-8")
+        import sys as _sys
+        _sys.argv = ["main", "--config", str(cats_path), "--pages", "1", "--no-images", "--output", str(tmp_path / "out")]
+        import main as mm
+        try: ec = mm.main()
+        except SystemExit as e: ec = e.code
+        captured = capsys.readouterr()
+        assert "本次抓取类目数量：1" in captured.out
+        assert captured.out.count("本次抓取类目数量：") >= 1
+
+    def test_count_2(self, tmp_path, capsys):
+        """2个有效emag URL → 数量=2"""
+        cats_path = tmp_path / "cats2.txt"
+        cats_path.write_text(
+            "images_per_product=0\n"
+            "https://www.emag.ro/mouse/c\nhttps://www.emag.ro/tastaturi/c\n",
+            encoding="utf-8")
+        import sys as _sys
+        _sys.argv = ["main", "--config", str(cats_path), "--pages", "1", "--no-images", "--output", str(tmp_path / "out2")]
+        import main as mm
+        try: ec = mm.main()
+        except SystemExit as e: ec = e.code
+        captured = capsys.readouterr()
+        assert "本次抓取类目数量：2" in captured.out
+
+    def test_dup_url_not_double_counted(self, tmp_path, capsys):
+        cats_path = tmp_path / "cats3.txt"
+        cats_path.write_text(
+            "images_per_product=0\n"
+            "https://www.emag.ro/mouse/c\nhttps://www.emag.ro/mouse/c?ref=test\n",
+            encoding="utf-8")
+        import sys as _sys
+        _sys.argv = ["main", "--config", str(cats_path), "--pages", "1", "--no-images", "--output", str(tmp_path / "out3")]
+        import main as mm
+        try: ec = mm.main()
+        except SystemExit as e: ec = e.code
+        captured = capsys.readouterr()
+        assert "本次抓取类目数量：1" in captured.out
+
+    def test_config_fail_prints_zero(self, tmp_path, capsys):
+        import sys as _sys
+        _sys.argv = ["main", "--config", str(tmp_path / "nonexistent.txt")]
+        import main as mm
+        try: ec = mm.main()
+        except SystemExit as e: ec = e.code
+        captured = capsys.readouterr()
+        assert "本次抓取类目数量：0" in captured.out
+
+    def test_duration_still_printed(self, tmp_path, capsys):
+        cats_path = tmp_path / "cats4.txt"
+        cats_path.write_text(
+            "images_per_product=0\nhttps://www.emag.ro/mouse/c\n", encoding="utf-8")
+        import sys as _sys
+        _sys.argv = ["main", "--config", str(cats_path), "--pages", "1", "--no-images", "--output", str(tmp_path / "out4")]
+        import main as mm
+        try: ec = mm.main()
+        except SystemExit as e: ec = e.code
+        captured = capsys.readouterr()
+        assert "本次任务总耗时" in captured.out

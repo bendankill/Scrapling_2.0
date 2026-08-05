@@ -77,6 +77,7 @@ def main():
     try: txt_cfg, category_urls = load_config(args.config)
     except (FileNotFoundError, ValueError) as e:
         print(f"[错误] {e}", file=sys.stderr)
+        print(f"  本次抓取类目数量：0")
         print(f"  本次任务总耗时：{_fmt_duration(time.perf_counter() - t_start)}")
         return EXIT_CONFIG_ERROR
 
@@ -100,6 +101,7 @@ def main():
     for u in category_urls:
         name = _cat_name(u, len(categories)+1)
         categories.append({"name": name, "url": u, "enabled": True})
+    cat_count = len(categories)  # 本次实际抓取的有效类目数量
 
     max_pages = None if args.all_pages else args.pages
     out = args.output or make_output_dir(); os.makedirs(out, exist_ok=True)
@@ -108,6 +110,7 @@ def main():
     # 启动信息
     dl_images = (not args.no_images) and (final["images_per_product"] >= 1)
     print(f"{'='*60}\n  eMAG V2.1.3 (纯HTTP)\n{'='*60}")
+    print(f"  本次抓取类目数量：{cat_count}")
     for c in categories: print(f"    {c['name']}: {c['url']}")
     print(f"  页数: {'最多20' if max_pages is None else str(max_pages)}")
     print(f"  图片: {'否' if not dl_images else '是'}")
@@ -140,6 +143,7 @@ def main():
 
     elapsed = time.perf_counter() - t_start
     print(f"\n{'='*60}\n  任务结束 (退出码: {ec})\n{'='*60}")
+    print(f"  本次抓取类目数量：{cat_count}")
     print(f"  商品记录/唯一: {tot.get('total_records',0)}/{tot.get('unique_products',0)}")
     print(f"  成功/失败页: {tot.get('success_pages',0)}/{tot.get('failed_pages',0)}")
     print(f"  状态: {summary.get('status','')}")
