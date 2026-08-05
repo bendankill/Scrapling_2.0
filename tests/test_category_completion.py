@@ -183,3 +183,100 @@ class TestCategoryCompletion:
         assert rs["totals"]["completed_categories"] == 2
         for cat_d in rs["categories"]:
             assert "completed" in cat_d
+
+# ============================================================
+# V2.1.4: HTTP 200 WAF 误判修复测试
+# ============================================================
+class TestHttp200WafFix:
+    def test_normal_page_with_aws_script_not_waf(self, srv, tmp_path):
+        """正常商品页包含aws-waf-token脚本 → 不应判WAF"""
+        page = ('<html><head><script>var x="aws-waf-token";</script></head><body>'
+                + "".join(PC.format(i,i,i,f"PNK{i}",i*10) for i in range(1,4))
+                + '</body></html>')
+        srv.sr({"/test/c": (200, "text/html", page)})
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/test/c"]), max_pages=1)
+        s = c.finalize()
+        assert s["status"] == "completed"
+        assert s["totals"]["total_records"] == 3  # 3个商品正常保存
+        assert c.get_exit_code() == 0
+
+    def test_product_page_with_awswafcaptcha_not_waf(self, srv, tmp_path):
+        """商品页包含AwsWafCaptcha字符串 → 不应判WAF"""
+        page = ('<html><script>AwsWafCaptcha.init()</script><body>'
+                + "".join(PC.format(i,i,i,f"PNK{i}",i*10) for i in range(1,3))
+                + '</body></html>')
+        srv.sr({"/test/c": (200, "text/html", page)})
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/test/c"]), max_pages=1)
+        s = c.finalize()
+        assert s["status"] == "completed"
+        assert s["totals"]["total_records"] == 2
+
+    def test_real_waf_200_no_products(self, srv, tmp_path):
+        """HTTP 200, 无商品 + AWS WAF标记 → 判WAF"""
+        page = '<html><head><title>eMAG Captcha</title></head><body><script>aws-waf-token</script><div id="captcha"></div></body></html>'
+        srv.sr({"/test/c": (200, "text/html", page)})
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/test/c"]), max_pages=1)
+        s = c.finalize()
+        assert s["status"] == "waf_blocked"
+        assert c.get_exit_code() == 3
+
+    def test_403_always_waf_even_with_products(self, srv, tmp_path):
+        """403即使正文有商品卡片也必须判WAF"""
+        page = PC.format(1,1,1,"X",10)
+        srv.sr({"/test/c": (403, "text/html", page)})
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/test/c"]), max_pages=1)
+        s = c.finalize()
+        assert s["status"] == "waf_blocked"
+        assert c.get_exit_code() == 3
+
+    def test_fake_data_product_id_string_not_real_cards(self, srv, tmp_path):
+        """HTML脚本含data-product-id字符串但无真实DOM → 不误判为有商品"""
+        page = '<html><script>var x="data-product-id";</script><body><div id="captcha"></div></body></html>'
+        srv.sr({"/test/c": (200, "text/html", page)})
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/test/c"]), max_pages=1)
+        s = c.finalize()
+        # 无真实商品, 无WAF强标记, 应为空类目(completed)
+        assert s["status"] in ("completed", "network_error")
+
+    def test_empty_category_not_waf(self, srv, tmp_path):
+        """HTTP 200空类目(无商品无WAF标记) → 正常结束, 不判WAF"""
+        srv.sr({"/test/c": (200, "text/html", "<html><body><p>No results</p></body></html>")})
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/test/c"]), max_pages=1)
+        s = c.finalize()
+        assert s["status"] != "waf_blocked"
+
+    def test_stable_detection_3_times(self):
+        """同一HTML连续3次判断结果一致"""
+        from utils import detect_waf_block
+        normal = '<html><body>' + PC.format(1,1,1,"X",10) + '<script>aws-waf-token</script></body></html>'
+        for _ in range(3):
+            assert detect_waf_block(normal, 200, "http://t/c") is None
+        waf = '<html><head><title>eMAG Captcha</title></head><body><script>aws-waf-token</script></body></html>'
+        for _ in range(3):
+            assert detect_waf_block(waf, 200, "http://t/c") is not None
+
+    def test_waf_data_still_saved(self, srv, tmp_path):
+        """WAF前类目商品完整保存"""
+        p1 = _mp(1, 2, hn=False)
+        p2_waf = '<html><head><title>eMAG Captcha</title></head><body><script>aws-waf-token</script></body></html>'
+        srv.sr({"/cat1/c": (200, "text/html", p1), "/cat2/c": (200, "text/html", p2_waf)})
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/cat1/c","/cat2/c","/cat3/c"]), max_pages=1)
+        s = c.finalize()
+        assert s["totals"]["total_records"] == 2
+        assert os.path.exists(os.path.join(out, "products.json"))
+        data = json.load(open(os.path.join(out, "products.json"), encoding="utf-8"))
+        assert len(data) == 2

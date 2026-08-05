@@ -190,7 +190,12 @@ def detect_waf_block(html: str, http_status: int, url: str,
 
     html_lower = html.lower()
 
-    # --- HTML 正文中的 WAF/验证码特征 ---
+    # --- HTTP 200: 先判断是否存在真实商品卡片 ---
+    # 正常商品列表页即使包含AWS WAF脚本也不判WAF
+    if _page_has_product_cards(html):
+        return None
+
+    # 无商品卡片: 检查WAF/验证码标记
     aws_waf_markers = [
         "aws-waf-token", "awswaf-captcha", "captcha-sdk.awswaf",
         "awsWafCookieDomainList", "AwsWafCaptcha",
@@ -204,22 +209,40 @@ def detect_waf_block(html: str, http_status: int, url: str,
 
     # 验证码/人机验证页面特征
     captcha_markers = [
-        "emag captcha", "captcha", "human verification",
+        "emag captcha", "human verification",
         "access denied", "please verify you are human",
         "are you a human", "verify you are human",
         "unusual traffic", "trafic neobisnuit",
     ]
-    has_products = "data-product-id" in html_lower
+    captcha_hits = [m for m in captcha_markers if m in html_lower]
+    if captcha_hits:
+        return WafBlockError(
+            http_status, category, page_num, url, "CAPTCHA_PAGE",
+            f"Captcha markers found: {', '.join(captcha_hits[:3])}"
+        )
 
-    if not has_products:
-        captcha_hits = [m for m in captcha_markers if m in html_lower]
-        if captcha_hits:
-            return WafBlockError(
-                http_status, category, page_num, url, "CAPTCHA_PAGE",
-                f"Captcha markers found: {', '.join(captcha_hits[:3])}"
-            )
+    # eMAG-specific: title contains captcha, no products
+    if "emag captcha" in html_lower or ("captcha" in html_lower and "emag" in html_lower):
+        return WafBlockError(
+            http_status, category, page_num, url, "EMAG_CAPTCHA",
+            "eMAG captcha page detected, no products present"
+        )
 
     return None
+
+
+def _page_has_product_cards(html: str) -> bool:
+    """V2.1.4: 使用DOM选择器检查真实商品卡片, 不只用字符串匹配"""
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "lxml")
+        cards = soup.select(".card-item.card-standard.js-product-data")
+        if not cards:
+            cards = soup.select("[data-product-id]")
+            cards = [c for c in cards if c.get("data-product-id")]
+        return len(cards) > 0
+    except Exception:
+        return "data-product-id" in html.lower()
 
 
 # 保持旧函数名兼容
