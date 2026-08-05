@@ -1,4 +1,4 @@
-# eMAG 商品列表爬虫 V2.1.2
+# eMAG 商品列表爬虫 V2.1.3
 
 基于 [Scrapling](https://github.com/D4Vinci/Scrapling) 纯 HTTP Fetcher 的 eMAG（罗马尼亚电商）商品列表页爬虫。
 
@@ -14,7 +14,7 @@
 | V2.0.1 | 2026-08-03 | 纯 HTTP 改造（删除浏览器）、TXT 类目配置、JSON 标准输出、WAF 退出码 |
 | V2.0.0 | 2026-08-03 | 初始 MVP 版本 |
 
-> 当前最新版本为 **V2.1.2**。运行 `python main.py --version` 可确认本地版本。完整变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+> 当前最新版本为 **V2.1.3**。运行 `python main.py --version` 可确认本地版本。完整变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 重要：纯 HTTP 模式
 
