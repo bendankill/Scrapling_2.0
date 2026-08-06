@@ -238,15 +238,16 @@ class TestHttp200WafFix:
         assert c.get_exit_code() == 3
 
     def test_fake_data_product_id_string_not_real_cards(self, srv, tmp_path):
-        """HTML脚本含data-product-id字符串但无真实DOM → 不误判为有商品"""
+        """HTML脚本含data-product-id字符串+可见captcha容器 → 判WAF"""
         page = '<html><script>var x="data-product-id";</script><body><div id="captcha"></div></body></html>'
         srv.sr({"/test/c": (200, "text/html", page)})
         out = str(tmp_path / "o")
         c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
         c.crawl_all_categories(_mc(srv, ["/test/c"]), max_pages=1)
         s = c.finalize()
-        # 无真实商品, 无WAF强标记, 应为空类目(completed)
-        assert s["status"] in ("completed", "network_error")
+        # 可见captcha容器 + 无商品 → WAF
+        assert s["status"] == "waf_blocked"
+        assert c.get_exit_code() == 3
 
     def test_empty_category_not_waf(self, srv, tmp_path):
         """HTTP 200空类目(无商品无WAF标记) → 正常结束, 不判WAF"""
@@ -408,3 +409,35 @@ class TestStrictWafDetection:
         s = c.finalize()
         assert s["status"] == "waf_blocked"
         assert s["totals"]["total_records"] == 0
+# ============================================================
+# S0修复: 无预判解析 + 正文WAF + 空类目 + 未知页面
+# ============================================================
+class TestS0Fixes:
+    def test_fallback_title_parsed(self, srv, tmp_path):
+        """data-name缺失但.card-v2-title可用 → 输出1条"""
+        page = ("<html><body><div class=\"card-item card-standard js-product-data\""
+                " data-product-id=\"1\" data-url=\"https://www.emag.ro/test/pd/PNK1/\">"
+                "<a class=\"card-v2-title\">Fallback Title</a>"
+                "<p class=\"product-new-price\">10,99Lei</p></div></body></html>")
+        srv.sr({"/test/c": (200, "text/html", page)})
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/test/c"]), max_pages=1)
+        s = c.finalize()
+        assert s["totals"]["total_records"] == 1
+        assert s["status"] == "completed"
+
+
+    def test_body_waf_verify_human(self, srv, tmp_path):
+        """正文Please verify you are human → WAF"""
+        page = ("<html><head><title>Security</title></head>"
+                "<body><p>Please verify you are human</p>"
+                "<div id=\"captcha\"></div></body></html>")
+        srv.sr({"/test/c": (200, "text/html", page)})
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/test/c"]), max_pages=1)
+        s = c.finalize()
+        assert s["status"] == "waf_blocked"
+        assert c.get_exit_code() == 3
+

@@ -168,16 +168,38 @@ class EmagCrawler:
         pr.total_pages = _extract_total_pages_soup(soup)
         pr.html_hash = hashlib.md5(html.encode()).hexdigest()
 
-        # 商品解析(复用soup)
-        from utils import _page_has_valid_product_soup
-        has_products = _page_has_valid_product_soup(soup)
-        if not has_products:
-            # 无有效商品: 空类目或最后一页
-            pr.is_last_page = True; return pr
+        # S0-1修复: 直接解析商品, 不使用前置预判
         products, parse_errors = self._parse_products_soup(soup, name, base_url, page_url, page_num)
         pr.cards_found = len(products) + len(parse_errors)
         pr.products_parsed = len(products); pr.parse_failed = len(parse_errors)
         pr.parse_errors = parse_errors; pr.all_products = list(products)
+
+        if not products and not parse_errors:
+            # 无候选卡片: S0-2判断(WAF/空类目/未知页面)
+            # 再次检查正文WAF证据(更全面的检查)
+            page_text = soup.get_text(" ", strip=True).lower()
+            # 明确空类目标记
+            if "niciun produs" in page_text or "nu am gasit" in page_text:
+                pr.is_last_page = True; return pr
+            # 检查WAF正文证据
+            waf_body = _check_body_waf(soup)
+            if waf_body:
+                pr.waf_error = WafBlockError(200, name, page_num, page_url,
+                    "STRONG_WAF_EVIDENCE", f"WAF body evidence: {waf_body}")
+                return pr
+            # 未知页面
+            pr.analysis_failed = True
+            pr.fatal_error_type = "UNKNOWN_HTTP200_PAGE"
+            pr.fatal_error_detail = "No products, no empty-category, no WAF evidence"
+            return pr
+
+        if products:
+            return pr
+
+        # 全部解析失败
+        pr.analysis_failed = True
+        pr.fatal_error_type = "ALL_PARSE_FAILED"
+        pr.fatal_error_detail = f"All {len(parse_errors)} cards failed to parse"
         return pr
 
     @staticmethod
@@ -219,7 +241,9 @@ class EmagCrawler:
         if pr.waf_error:
             self._handle_stop(RunStatus.WAF_BLOCKED, name, 1, pr.page_url, pr.waf_error); return stats
         if pr.analysis_failed:
-            stats.failed_pages += 1; stats.stop_reason = "page_analysis_error"
+            stats.failed_pages += 1
+            stats.stop_reason = pr.fatal_error_type or "page_analysis_error"
+            self._log_error(name, 1, url, stats.stop_reason, detail=pr.fatal_error_detail)
             self._run_status = RunStatus.NETWORK_ERROR; return stats
         if pr.http_status != 200:
             stats.failed_pages += 1
@@ -271,7 +295,8 @@ class EmagCrawler:
                             self._handle_stop(RunStatus.WAF_BLOCKED, name, next_expected, pr.page_url, pr.waf_error)
                             self._stop_event.set(); stopped = True; break
                         if pr.analysis_failed:
-                            stats.failed_pages += 1; stats.stop_reason = "page_analysis_error"
+                            stats.failed_pages += 1; stats.stop_reason = pr.fatal_error_type or "page_analysis_error"
+                            self._log_error(name, next_expected, pr.page_url, stats.stop_reason, detail=pr.fatal_error_detail)
                             self._run_status = RunStatus.NETWORK_ERROR; stopped = True; break
                         if pr.http_status != 200:
                             stats.failed_pages += 1; stats.stop_reason = "network_error"
@@ -491,6 +516,32 @@ def _extract_next_page_soup(soup, current_url: str) -> str:
             href = a.get("href")
             if href and href != "javascript:void(0)": return urljoin(current_url, href)
     return None
+
+def _check_body_waf(soup) -> str:
+    """检查soup正文中强WAF证据 (可见文本+控件)"""
+    from bs4 import NavigableString
+    visible = []
+    for el in soup.select("body *"):
+        try:
+            style = (el.get("style") or "").lower()
+            if "display:none" in style or "display: none" in style: continue
+            if el.get("hidden") is not None: continue
+        except Exception: pass
+        t = el.get_text(strip=True)
+        if t: visible.append(t.lower())
+    body = " ".join(visible)
+    for m in ["please verify you are human", "verify you are human",
+              "human verification", "trafic neobisnuit", "access denied"]:
+        if m in body: return m
+    cc = soup.select("#captcha, .captcha, [class*=captcha], #challenge, .challenge")
+    for c in cc:
+        try:
+            if c.get("hidden") is not None: continue
+            if "display:none" in (c.get("style") or "").lower(): continue
+            return f"captcha container: {c.get('id','') or c.get('class','')}"
+        except Exception: pass
+    return ""
+
 
 def _extract_total_pages_soup(soup):
     import re

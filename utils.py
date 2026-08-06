@@ -172,12 +172,15 @@ def detect_waf_block(html: str, http_status: int, url: str,
     if not html:
         return None
 
-    # HTTP 200: 仅检查强WAF证据(页面标题明确为验证码中间页)
-    # 弱标记(AWS脚本等)不在此处检查——由调用方在确认无商品后自行判断
+    # HTTP 200: 强WAF证据(标题+正文+可见控件)
     if soup is not None:
         title = _get_page_title_soup(soup)
         if _is_strong_waf_title(title):
             return WafBlockError(http_status, category, page_num, url, "STRONG_WAF_EVIDENCE", f"Strong WAF title: {title[:60]}")
+        # S0-2: 检查正文中的强WAF证据(可见文本+控件)
+        body_evidence = _soup_strong_waf_body(soup)
+        if body_evidence:
+            return WafBlockError(http_status, category, page_num, url, "STRONG_WAF_EVIDENCE", f"Strong WAF body: {body_evidence[:80]}")
     else:
         try:
             from bs4 import BeautifulSoup
@@ -185,10 +188,61 @@ def detect_waf_block(html: str, http_status: int, url: str,
             title = _get_page_title_soup(s2)
             if _is_strong_waf_title(title):
                 return WafBlockError(http_status, category, page_num, url, "STRONG_WAF_EVIDENCE", f"Strong WAF title: {title[:60]}")
+            body_evidence = _soup_strong_waf_body(s2)
+            if body_evidence:
+                return WafBlockError(http_status, category, page_num, url, "STRONG_WAF_EVIDENCE", f"Strong WAF body: {body_evidence[:80]}")
         except Exception:
             if "emag captcha" in html.lower():
                 return WafBlockError(http_status, category, page_num, url, "STRONG_WAF_EVIDENCE", "eMAG Captcha title (text)")
+            hl = html.lower()
+            strong_body = ["please verify you are human", "verify you are human",
+                           "human verification", "trafic neobisnuit"]
+            for sb in strong_body:
+                if sb in hl:
+                    return WafBlockError(http_status, category, page_num, url, "STRONG_WAF_EVIDENCE", f"Strong WAF body text: {sb}")
     return None
+
+
+def _soup_strong_waf_body(soup) -> str:
+    """检查soup中可见正文是否包含强WAF证据"""
+    # 提取可见文本
+    visible_texts = []
+    for el in soup.select("body *"):
+        if not _is_visible_element(el):
+            continue
+        txt = el.get_text(strip=True)
+        if txt:
+            visible_texts.append(txt.lower())
+    body_lower = " ".join(visible_texts)
+    # 强WAF正文标记
+    strong_markers = [
+        "please verify you are human", "verify you are human",
+        "human verification", "am detectat trafic neobisnuit",
+        "trafic neobisnuit", "access denied",
+    ]
+    for m in strong_markers:
+        if m in body_lower:
+            return m
+    # 可见captcha控件
+    captcha_containers = soup.select(
+        "#captcha, .captcha, [class*=captcha], [id*=captcha], "
+        "#challenge, .challenge, [class*=challenge]"
+    )
+    for c in captcha_containers:
+        if _is_visible_element(c):
+            return f"visible captcha/challenge container: {c.get('id','') or c.get('class','')}"
+    return ""
+
+
+def _is_visible_element(el) -> bool:
+    """判断元素是否可见(排除隐藏节点)"""
+    if not hasattr(el, 'get'): return True
+    style = (el.get("style") or "").lower()
+    if "display:none" in style or "display: none" in style: return False
+    if "visibility:hidden" in style or "visibility: hidden" in style: return False
+    if el.get("hidden") is not None: return False
+    if el.get("aria-hidden") == "true": return False
+    return True
 
 
 def _is_strong_waf_title(title: str) -> bool:
