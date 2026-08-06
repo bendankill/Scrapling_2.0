@@ -232,17 +232,23 @@ def detect_waf_block(html: str, http_status: int, url: str,
 
 
 def _page_has_product_cards(html: str) -> bool:
-    """V2.1.4: 使用DOM选择器检查真实商品卡片, 不只用字符串匹配"""
+    """V2.1.4-fix: 严格检查至少一张有效商品卡片(HAS title + URL含/pd/ + 含PNK)"""
     try:
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "lxml")
         cards = soup.select(".card-item.card-standard.js-product-data")
         if not cards:
             cards = soup.select("[data-product-id]")
-            cards = [c for c in cards if c.get("data-product-id")]
-        return len(cards) > 0
+        for card in cards:
+            pid = card.get("data-product-id", "").strip()
+            title = card.get("data-name", "").strip()
+            url = card.get("data-url", "").strip()
+            if pid and title and url and "/pd/" in url:
+                return True
+        return False
     except Exception:
-        return "data-product-id" in html.lower()
+        # DOM解析失败: 不能判定为有商品, 让调用方走WAF/错误流程
+        return False
 
 
 # 保持旧函数名兼容

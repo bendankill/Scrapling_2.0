@@ -130,27 +130,54 @@ class EmagCrawler:
             if h in self._cat_page_hashes[ck]: return True
             self._cat_page_hashes[ck].add(h); return False
 
-    # ---- 单页解析 (纯工作线程, 不修改全局状态) ----
+    # ---- 单页解析 (V2.1.4-fix: 只解析一次HTML) ----
     def _fetch_and_parse_page(self, name, base_url, page_num, page_url) -> PageResult:
         pr = PageResult(page_number=page_num, page_url=page_url)
         html, st = self._fetch_page(page_url); pr.http_status = st
+
+        # WAF检测(对403/429/511可提前返回)
         waf = detect_waf_block(html or "", st, page_url, category=name, page_num=page_num)
         if waf: pr.waf_error = waf; return pr
         if st != 200 or not html: return pr
-        if not page_has_products(html): pr.is_last_page = True; return pr
+
+        # V2.1.4-fix: 一次性解析HTML, 复用于所有后续操作
+        soup = self._parse_html_once(html)
+        if soup is None:
+            # DOM解析失败
+            if _page_has_waf_evidence(html):
+                pr.waf_error = WafBlockError(200, name, page_num, page_url,
+                    "CAPTCHA_PAGE", "DOM parse failed + WAF evidence")
+                return pr
+            self._log_error(name, page_num, page_url, "PAGE_ANALYSIS_ERROR",
+                          detail="DOM parse failed, no WAF evidence")
+            return pr
+
+        # 页面元数据 (复用soup)
+        pr.next_url = extract_next_page_soup(soup, page_url) or ""
+        pr.has_next = bool(pr.next_url)
+        pr.total_pages = extract_total_pages_soup(soup)
         pr.html_hash = hashlib.md5(html.encode()).hexdigest()
-        pr.next_url = extract_next_page(html, page_url) or ""
-        pr.has_next = bool(pr.next_url); pr.total_pages = extract_total_pages(html)
-        products, parse_errors = self._parse_products(html, name, base_url, page_url, page_num)
+
+        # 商品解析 (复用soup)
+        if not _soup_has_product_cards(soup):
+            pr.is_last_page = True; return pr
+        products, parse_errors = self._parse_products_soup(soup, name, base_url, page_url, page_num)
         pr.cards_found = len(products) + len(parse_errors)
         pr.products_parsed = len(products); pr.parse_failed = len(parse_errors)
         pr.parse_errors = parse_errors; pr.all_products = list(products)
         return pr
 
-    def _parse_products(self, html, name, base_url, page_url, page_num):
-        if not html or len(html) < 100: return [], []
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "lxml")
+    @staticmethod
+    def _parse_html_once(html: str):
+        """一次性HTML解析, 返回BeautifulSoup对象或None"""
+        try:
+            from bs4 import BeautifulSoup
+            return BeautifulSoup(html, "lxml")
+        except Exception:
+            return None
+
+    def _parse_products_soup(self, soup, name, base_url, page_url, page_num):
+        """从已解析的soup提取商品"""
         cards = soup.select(".card-item.card-standard.js-product-data")
         if not cards:
             cards = soup.select("[data-product-id]")
@@ -435,3 +462,63 @@ class EmagCrawler:
 
     def get_exit_code(self):
         return (RunStatus.INTERRUPTED if self._interrupted else self._run_status).exit_code
+
+
+# ============================================================
+# V2.1.4-fix: Soup-based helpers (避免重复DOM解析)
+# ============================================================
+def _soup_has_product_cards(soup) -> bool:
+    """使用已解析的soup检查是否有有效商品卡片"""
+    from utils import _page_has_product_cards
+    cards = soup.select(".card-item.card-standard.js-product-data")
+    if not cards:
+        cards = soup.select("[data-product-id]")
+    for card in cards:
+        pid = card.get("data-product-id", "").strip()
+        title = card.get("data-name", "").strip()
+        url = card.get("data-url", "").strip()
+        if pid and title and url and "/pd/" in url:
+            return True
+    return False
+
+
+def extract_next_page_soup(soup, current_url: str) -> str:
+    """从soup提取下一页URL"""
+    from urllib.parse import urljoin
+    nl = soup.select_one('link[rel="next"]')
+    if nl and nl.get("href"):
+        return urljoin(current_url, nl.get("href"))
+    for a in soup.select('[class*="pagination"] a'):
+        if "urmatoare" in a.get_text(strip=True).lower():
+            href = a.get("href")
+            if href and href != "javascript:void(0)":
+                return urljoin(current_url, href)
+    return None
+
+
+def extract_total_pages_soup(soup):
+    """从soup提取总页数"""
+    import re
+    max_page = 0
+    for item in soup.select('[class*="pagination"] a, [class*="pagination"] span'):
+        text = item.get_text(strip=True)
+        m = re.search(r'(\d+)\s*din\s*(\d+)', text)
+        if m:
+            total = int(m.group(2))
+            if total > max_page: max_page = total
+        try:
+            n = int(text)
+            if n > max_page: max_page = n
+        except ValueError: pass
+    return max_page if max_page > 0 else None
+
+
+def _page_has_waf_evidence(html: str) -> bool:
+    """检查非商品页面是否存在强WAF证据"""
+    if not html: return False
+    hl = html.lower()
+    strong = ["emag captcha", "human verification", "access denied",
+              "please verify you are human", "are you a human",
+              "verify you are human", "unusual traffic", "trafic neobisnuit",
+              "aws-waf-token", "captcha-sdk.awswaf"]
+    return any(m in hl for m in strong)
