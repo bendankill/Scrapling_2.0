@@ -158,97 +158,68 @@ def _category_name_from_url(url: str, index: int) -> str:
 # WAF / Captcha / 访问限制 检测 (V2.0.2 统一处理)
 # ============================================================
 def detect_waf_block(html: str, http_status: int, url: str,
-                     category: str = "", page_num: int = 0) -> Optional[WafBlockError]:
-    """
-    检测是否遇到 WAF、验证码或访问限制。
-    HTTP 403, 429, 511 统一视为阻断，无论响应正文内容。
-    同时检测响应正文中的验证码特征。
-    """
-    # --- 无条件阻断的 HTTP 状态码 ---
+                     category: str = "", page_num: int = 0,
+                     soup=None) -> Optional[WafBlockError]:
+    """HTTP 403/429/511无条件阻断。HTTP 200+soup: 强WAF标题优先。soup=None时仅检查标题。"""
     if http_status in (403, 429, 511):
         block_names = {403: "HTTP_403_FORBIDDEN", 429: "HTTP_429_RATE_LIMIT", 511: "HTTP_511_WAF"}
-        block_type = block_names.get(http_status, f"HTTP_{http_status}")
-        evidence_parts = [f"HTTP {http_status}"]
+        ep = [f"HTTP {http_status}"]
         if html:
-            html_lower = html.lower()
-            # 收集额外的上下文信息
-            if "captcha" in html_lower:
-                evidence_parts.append("captcha keyword in body")
-            if "waf" in html_lower:
-                evidence_parts.append("WAF keyword in body")
-            if "blocked" in html_lower:
-                evidence_parts.append("blocked keyword in body")
-            if "aws" in html_lower:
-                evidence_parts.append("AWS keyword in body")
-        return WafBlockError(
-            http_status, category, page_num, url,
-            block_type, "; ".join(evidence_parts)
-        )
-
+            hl = html.lower()
+            if "captcha" in hl: ep.append("captcha in body")
+            if "waf" in hl: ep.append("WAF in body")
+        return WafBlockError(http_status, category, page_num, url, block_names.get(http_status, f"HTTP_{http_status}"), "; ".join(ep))
     if not html:
         return None
 
-    html_lower = html.lower()
-
-    # --- HTTP 200: 先判断是否存在真实商品卡片 ---
-    # 正常商品列表页即使包含AWS WAF脚本也不判WAF
-    if _page_has_product_cards(html):
-        return None
-
-    # 无商品卡片: 检查WAF/验证码标记
-    aws_waf_markers = [
-        "aws-waf-token", "awswaf-captcha", "captcha-sdk.awswaf",
-        "awsWafCookieDomainList", "AwsWafCaptcha",
-    ]
-    aws_hits = [m for m in aws_waf_markers if m.lower() in html_lower]
-    if aws_hits:
-        return WafBlockError(
-            http_status, category, page_num, url, "AWS_WAF_MARKERS",
-            f"AWS WAF markers found: {', '.join(aws_hits[:3])}"
-        )
-
-    # 验证码/人机验证页面特征
-    captcha_markers = [
-        "emag captcha", "human verification",
-        "access denied", "please verify you are human",
-        "are you a human", "verify you are human",
-        "unusual traffic", "trafic neobisnuit",
-    ]
-    captcha_hits = [m for m in captcha_markers if m in html_lower]
-    if captcha_hits:
-        return WafBlockError(
-            http_status, category, page_num, url, "CAPTCHA_PAGE",
-            f"Captcha markers found: {', '.join(captcha_hits[:3])}"
-        )
-
-    # eMAG-specific: title contains captcha, no products
-    if "emag captcha" in html_lower or ("captcha" in html_lower and "emag" in html_lower):
-        return WafBlockError(
-            http_status, category, page_num, url, "EMAG_CAPTCHA",
-            "eMAG captcha page detected, no products present"
-        )
-
+    # HTTP 200: 仅检查强WAF证据(页面标题明确为验证码中间页)
+    # 弱标记(AWS脚本等)不在此处检查——由调用方在确认无商品后自行判断
+    if soup is not None:
+        title = _get_page_title_soup(soup)
+        if _is_strong_waf_title(title):
+            return WafBlockError(http_status, category, page_num, url, "STRONG_WAF_EVIDENCE", f"Strong WAF title: {title[:60]}")
+    else:
+        try:
+            from bs4 import BeautifulSoup
+            s2 = BeautifulSoup(html, "lxml")
+            title = _get_page_title_soup(s2)
+            if _is_strong_waf_title(title):
+                return WafBlockError(http_status, category, page_num, url, "STRONG_WAF_EVIDENCE", f"Strong WAF title: {title[:60]}")
+        except Exception:
+            if "emag captcha" in html.lower():
+                return WafBlockError(http_status, category, page_num, url, "STRONG_WAF_EVIDENCE", "eMAG Captcha title (text)")
     return None
 
 
-def _page_has_product_cards(html: str) -> bool:
-    """V2.1.4-fix: 严格检查至少一张有效商品卡片(HAS title + URL含/pd/ + 含PNK)"""
-    try:
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "lxml")
-        cards = soup.select(".card-item.card-standard.js-product-data")
-        if not cards:
-            cards = soup.select("[data-product-id]")
-        for card in cards:
-            pid = card.get("data-product-id", "").strip()
-            title = card.get("data-name", "").strip()
-            url = card.get("data-url", "").strip()
-            if pid and title and url and "/pd/" in url:
-                return True
-        return False
-    except Exception:
-        # DOM解析失败: 不能判定为有商品, 让调用方走WAF/错误流程
-        return False
+def _is_strong_waf_title(title: str) -> bool:
+    """页面标题是否为强验证码证据"""
+    if not title: return False
+    tl = title.lower().strip()
+    if "emag captcha" in tl: return True
+    if "captcha" in tl and ("verify" in tl or "human" in tl): return True
+    if "human verification" in tl: return True
+    return False
+
+
+def _get_page_title_soup(soup) -> str:
+    t = soup.select_one("title")
+    return t.get_text(strip=True) if t else ""
+
+
+def _page_has_valid_product_soup(soup) -> bool:
+    """统一商品卡片判断: 使用已解析soup检查有效商品卡片"""
+    from bs4 import Tag
+    cards = soup.select(".card-item.card-standard.js-product-data")
+    if not cards:
+        cards = soup.select("[data-product-id]")
+    for card in cards:
+        if not isinstance(card, Tag): continue
+        pid = (card.get("data-product-id") or "").strip()
+        title = (card.get("data-name") or "").strip()
+        url = (card.get("data-url") or "").strip()
+        if pid and title and url and "/pd/" in url:
+            return True
+    return False
 
 
 # 保持旧函数名兼容

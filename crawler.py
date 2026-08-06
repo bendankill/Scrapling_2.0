@@ -30,6 +30,9 @@ class PageResult:
     product_keys: list = field(default_factory=list)
     parse_errors: list = field(default_factory=list)
     html_hash: str = ""; waf_error = None; total_pages: Optional[int] = None
+    analysis_failed: bool = False
+    fatal_error_type: str = ""
+    fatal_error_detail: str = ""
 
 
 class CategoryStats:
@@ -130,36 +133,46 @@ class EmagCrawler:
             if h in self._cat_page_hashes[ck]: return True
             self._cat_page_hashes[ck].add(h); return False
 
-    # ---- 单页解析 (V2.1.4-fix: 只解析一次HTML) ----
+    # ---- 单页解析 (V2.1.4-final: 一次DOM解析) ----
     def _fetch_and_parse_page(self, name, base_url, page_num, page_url) -> PageResult:
         pr = PageResult(page_number=page_num, page_url=page_url)
-        html, st = self._fetch_page(page_url); pr.http_status = st
+        html, st = self._fetch_page(page_url)
+        pr.http_status = st
 
-        # WAF检测(对403/429/511可提前返回)
-        waf = detect_waf_block(html or "", st, page_url, category=name, page_num=page_num)
-        if waf: pr.waf_error = waf; return pr
+        # 403/429/511: 不解析DOM, 直接WAF
+        if st in (403, 429, 511):
+            waf = detect_waf_block(html or "", st, page_url, category=name, page_num=page_num, soup=None)
+            pr.waf_error = waf; return pr
         if st != 200 or not html: return pr
 
-        # V2.1.4-fix: 一次性解析HTML, 复用于所有后续操作
+        # HTTP 200: 一次性解析HTML
         soup = self._parse_html_once(html)
         if soup is None:
-            # DOM解析失败
-            if _page_has_waf_evidence(html):
+            pr.analysis_failed = True
+            pr.fatal_error_type = "PAGE_ANALYSIS_ERROR"
+            pr.fatal_error_detail = "DOM parse failed"
+            self._log_error(name, page_num, page_url, "PAGE_ANALYSIS_ERROR", detail="DOM parse failed")
+            # DOM解析失败: 用原始HTML简单检查强WAF标题
+            if "emag captcha" in html.lower():
                 pr.waf_error = WafBlockError(200, name, page_num, page_url,
-                    "CAPTCHA_PAGE", "DOM parse failed + WAF evidence")
-                return pr
-            self._log_error(name, page_num, page_url, "PAGE_ANALYSIS_ERROR",
-                          detail="DOM parse failed, no WAF evidence")
+                    "STRONG_WAF_EVIDENCE", "eMAG Captcha title (text)")
             return pr
 
-        # 页面元数据 (复用soup)
-        pr.next_url = extract_next_page_soup(soup, page_url) or ""
+        # 强WAF证据检查(使用soup, 仅检查标题)
+        waf3 = detect_waf_block(html, st, page_url, category=name, page_num=page_num, soup=soup)
+        if waf3: pr.waf_error = waf3; return pr
+
+        # 元数据(复用soup)
+        pr.next_url = _extract_next_page_soup(soup, page_url) or ""
         pr.has_next = bool(pr.next_url)
-        pr.total_pages = extract_total_pages_soup(soup)
+        pr.total_pages = _extract_total_pages_soup(soup)
         pr.html_hash = hashlib.md5(html.encode()).hexdigest()
 
-        # 商品解析 (复用soup)
-        if not _soup_has_product_cards(soup):
+        # 商品解析(复用soup)
+        from utils import _page_has_valid_product_soup
+        has_products = _page_has_valid_product_soup(soup)
+        if not has_products:
+            # 无有效商品: 空类目或最后一页
             pr.is_last_page = True; return pr
         products, parse_errors = self._parse_products_soup(soup, name, base_url, page_url, page_num)
         pr.cards_found = len(products) + len(parse_errors)
@@ -169,7 +182,6 @@ class EmagCrawler:
 
     @staticmethod
     def _parse_html_once(html: str):
-        """一次性HTML解析, 返回BeautifulSoup对象或None"""
         try:
             from bs4 import BeautifulSoup
             return BeautifulSoup(html, "lxml")
@@ -177,7 +189,6 @@ class EmagCrawler:
             return None
 
     def _parse_products_soup(self, soup, name, base_url, page_url, page_num):
-        """从已解析的soup提取商品"""
         cards = soup.select(".card-item.card-standard.js-product-data")
         if not cards:
             cards = soup.select("[data-product-id]")
@@ -190,12 +201,10 @@ class EmagCrawler:
                 if p: products.append(p)
                 else:
                     pos = card.get("data-position", str(idx+1)); pid = card.get("data-product-id","")
-                    errors.append({"position": pos, "product_id": pid,
-                                   "error_type": "PARSE_FAILED", "error_detail": "解析返回None"})
+                    errors.append({"position": pos, "product_id": pid, "error_type": "PARSE_FAILED", "error_detail": "解析返回None"})
             except Exception as e:
                 pos = card.get("data-position", str(idx+1)); pid = card.get("data-product-id","")
-                errors.append({"position": pos, "product_id": pid,
-                               "error_type": type(e).__name__, "error_detail": str(e)[:200]})
+                errors.append({"position": pos, "product_id": pid, "error_type": type(e).__name__, "error_detail": str(e)[:200]})
         return products, errors
 
     # ---- 类目抓取 ----
@@ -209,6 +218,9 @@ class EmagCrawler:
         pr = self._fetch_and_parse_page(name, url, 1, url); stats.requested_pages += 1
         if pr.waf_error:
             self._handle_stop(RunStatus.WAF_BLOCKED, name, 1, pr.page_url, pr.waf_error); return stats
+        if pr.analysis_failed:
+            stats.failed_pages += 1; stats.stop_reason = "page_analysis_error"
+            self._run_status = RunStatus.NETWORK_ERROR; return stats
         if pr.http_status != 200:
             stats.failed_pages += 1
             self._handle_stop(RunStatus.NETWORK_ERROR, name, 1, url, detail=f"HTTP {pr.http_status}"); return stats
@@ -258,6 +270,9 @@ class EmagCrawler:
                             stats.stop_reason = "waf_blocked"
                             self._handle_stop(RunStatus.WAF_BLOCKED, name, next_expected, pr.page_url, pr.waf_error)
                             self._stop_event.set(); stopped = True; break
+                        if pr.analysis_failed:
+                            stats.failed_pages += 1; stats.stop_reason = "page_analysis_error"
+                            self._run_status = RunStatus.NETWORK_ERROR; stopped = True; break
                         if pr.http_status != 200:
                             stats.failed_pages += 1; stats.stop_reason = "network_error"
                             self._handle_stop(RunStatus.NETWORK_ERROR, name, next_expected, pr.page_url, detail=f"HTTP {pr.http_status}")
@@ -465,39 +480,19 @@ class EmagCrawler:
 
 
 # ============================================================
-# V2.1.4-fix: Soup-based helpers (避免重复DOM解析)
+# V2.1.4-final: Soup helpers (单次DOM解析)
 # ============================================================
-def _soup_has_product_cards(soup) -> bool:
-    """使用已解析的soup检查是否有有效商品卡片"""
-    from utils import _page_has_product_cards
-    cards = soup.select(".card-item.card-standard.js-product-data")
-    if not cards:
-        cards = soup.select("[data-product-id]")
-    for card in cards:
-        pid = card.get("data-product-id", "").strip()
-        title = card.get("data-name", "").strip()
-        url = card.get("data-url", "").strip()
-        if pid and title and url and "/pd/" in url:
-            return True
-    return False
-
-
-def extract_next_page_soup(soup, current_url: str) -> str:
-    """从soup提取下一页URL"""
+def _extract_next_page_soup(soup, current_url: str) -> str:
     from urllib.parse import urljoin
     nl = soup.select_one('link[rel="next"]')
-    if nl and nl.get("href"):
-        return urljoin(current_url, nl.get("href"))
+    if nl and nl.get("href"): return urljoin(current_url, nl.get("href"))
     for a in soup.select('[class*="pagination"] a'):
         if "urmatoare" in a.get_text(strip=True).lower():
             href = a.get("href")
-            if href and href != "javascript:void(0)":
-                return urljoin(current_url, href)
+            if href and href != "javascript:void(0)": return urljoin(current_url, href)
     return None
 
-
-def extract_total_pages_soup(soup):
-    """从soup提取总页数"""
+def _extract_total_pages_soup(soup):
     import re
     max_page = 0
     for item in soup.select('[class*="pagination"] a, [class*="pagination"] span'):
@@ -511,14 +506,3 @@ def extract_total_pages_soup(soup):
             if n > max_page: max_page = n
         except ValueError: pass
     return max_page if max_page > 0 else None
-
-
-def _page_has_waf_evidence(html: str) -> bool:
-    """检查非商品页面是否存在强WAF证据"""
-    if not html: return False
-    hl = html.lower()
-    strong = ["emag captcha", "human verification", "access denied",
-              "please verify you are human", "are you a human",
-              "verify you are human", "unusual traffic", "trafic neobisnuit",
-              "aws-waf-token", "captcha-sdk.awswaf"]
-    return any(m in hl for m in strong)

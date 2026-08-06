@@ -132,7 +132,7 @@ class TestCaptchaDetection:
     def test_aws_waf_captcha_page(self):
         err = detect_waf_block(AWS_WAF_HTML, 200, "https://www.emag.ro/mouse/c")
         assert err is not None
-        assert "AWS_WAF" in err.block_type
+        assert ("AWS_WAF" in err.block_type or "STRONG_WAF" in err.block_type)
 
     def test_http_511_with_waf_markers(self):
         # 511 always triggers WAF (regardless of body)

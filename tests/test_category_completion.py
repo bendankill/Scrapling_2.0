@@ -375,3 +375,36 @@ class TestStrictWafDetection:
         waf = '<html><head><title>eMAG Captcha</title></head><body><script>aws-waf-token</script></body></html>'
         for _ in range(3):
             assert detect_waf_block(waf, 200, "http://t/c") is not None
+
+    def test_hidden_with_full_fields_waf(self, srv, tmp_path):
+        """字段完整的隐藏节点+标题eMAG Captcha → 强WAF优先"""
+        page = ('<html><head><title>eMAG Captcha</title></head><body>'
+                '<div style="display:none" class="card-item card-standard js-product-data"'
+                ' data-product-id="dummy" data-name="Fake Product"'
+                ' data-url="https://www.emag.ro/fake/pd/FAKE/">'
+                '<p class="product-new-price">1,99 Lei</p></div>'
+                '<script>aws-waf-token</script></body></html>')
+        srv.sr({"/test/c": (200, "text/html", page)})
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/test/c"]), max_pages=1)
+        s = c.finalize()
+        assert s["status"] == "waf_blocked"
+        assert s["totals"]["total_records"] == 0
+        assert c.get_exit_code() == 3
+
+    def test_visible_captcha_title_waf(self, srv, tmp_path):
+        """可见节点+标题eMAG Captcha → 强证据优先"""
+        page = ('<html><head><title>eMAG Captcha</title></head><body>'
+                '<div class="card-item card-standard js-product-data"'
+                ' data-product-id="dummy" data-name="Fake"'
+                ' data-url="https://www.emag.ro/fake/pd/FAKE/">'
+                '<p class="product-new-price">1,99 Lei</p></div>'
+                '<script>aws-waf-token</script></body></html>')
+        srv.sr({"/test/c": (200, "text/html", page)})
+        out = str(tmp_path / "o")
+        c = EmagCrawler(out, download_images=False, page_workers=1, category_workers=1, max_in_flight=2)
+        c.crawl_all_categories(_mc(srv, ["/test/c"]), max_pages=1)
+        s = c.finalize()
+        assert s["status"] == "waf_blocked"
+        assert s["totals"]["total_records"] == 0
