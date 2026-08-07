@@ -1,5 +1,27 @@
 # 更新日志
 
+## V2.1.4 (2026-08-07)
+
+### 修复
+- **HTTP 200页面分类**: 正确区分商品页、WAF、明确空类目、不可用类目和未知页面
+- **Tricouri Sport解析**: 兼容 `.card-fashion.js-product-data` 商品卡，并从收藏按钮JSON回填商品ID和Offer ID
+- **隐藏验证码误判**: 可见性检查覆盖元素自身及全部祖先节点的 `hidden`、`display:none`、`visibility:hidden`、`aria-hidden=true`
+- **script验证码误判**: 可见正文排除 `script`、`style`、`noscript`、`template`、`head` 和隐藏内容
+- **全部卡片解析失败**: 每张卡片的原始错误先写入 `errors.csv`，随后追加页面级 `ALL_PARSE_FAILED`
+
+### 新增
+- **未知HTTP 200诊断**: 异常时保存HTML和包含安全响应元数据、页面证据及解析计数的JSON
+- **真实结构fixture**: 增加脱敏后的 `Tricouri Sport` 最小真实DOM测试样本
+
+### 清理
+- 删除废弃的 `_page_has_valid_product_soup()`
+- 删除重复的 `crawler._check_body_waf()`，统一使用一套WAF与可见性规则
+
+### 测试
+- 新增19项专项测试，总测试数增至204项
+- 完整测试连续两次均为204项通过、0失败
+- 三次纯HTTP低频真实验证均成功解析60/60个 `Tricouri Sport` 商品
+
 ## V2.1.3 (2026-08-05)
 
 ### 新增
