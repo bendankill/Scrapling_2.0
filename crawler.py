@@ -9,14 +9,26 @@ from threading import Lock, Semaphore, Event
 from typing import Optional
 from scrapling.fetchers import FetcherSession
 from models import ProductItem
-from parser import parse_product_listing, extract_next_page, extract_total_pages, page_has_products
+from parser import _parse_product_card, select_product_cards
 from image_downloader import ImageDownloader
 from exporters import Exporters
-from utils import (detect_waf_block, WafBlockError, get_product_key,
-    write_errors_csv, write_atomic_json, ensure_errors_csv, RunStatus)
+from utils import (detect_waf_block, get_product_key,
+    write_errors_csv, write_atomic_json, ensure_errors_csv, RunStatus,
+    get_visible_page_text)
 
 logger = logging.getLogger("emag_crawler.crawler")
 ALL_PAGES_LIMIT = 20
+EMPTY_CATEGORY_MARKERS = (
+    "niciun produs", "nu am gasit", "nu am găsit",
+)
+CATEGORY_UNAVAILABLE_MARKERS = (
+    "categoria nu mai este disponibila",
+    "categoria nu mai este disponibilă",
+    "pagina nu mai este disponibila",
+    "pagina nu mai este disponibilă",
+    "aceasta categorie nu exista",
+    "această categorie nu există",
+)
 
 
 @dataclass
@@ -33,6 +45,27 @@ class PageResult:
     analysis_failed: bool = False
     fatal_error_type: str = ""
     fatal_error_detail: str = ""
+    final_url: str = ""
+    redirect_chain: list = field(default_factory=list)
+    content_type: str = ""
+    content_length: int = 0
+    page_title: str = ""
+    empty_evidence: str = ""
+    waf_evidence: str = ""
+    terminal_reason: str = ""
+    diagnostic_paths: list = field(default_factory=list)
+
+
+@dataclass
+class FetchResult:
+    html: Optional[str] = None
+    status: int = 0
+    request_url: str = ""
+    final_url: str = ""
+    redirect_chain: list = field(default_factory=list)
+    content_type: str = ""
+    content_length: int = 0
+    fetched_at: str = ""
 
 
 class CategoryStats:
@@ -115,14 +148,43 @@ class EmagCrawler:
 
     # ---- 页面获取 ----
     def _fetch_page(self, url):
-        if self._stop_event.is_set(): return None, 0
+        fetched_at = datetime.now(timezone.utc).isoformat()
+        if self._stop_event.is_set():
+            return FetchResult(request_url=url, final_url=url,
+                               fetched_at=fetched_at)
         with self.global_semaphore:
             try:
                 page = self._get_client().get(url)
-                return page.html_content, page.status
+                html = page.html_content or ""
+                final_url = str(getattr(page, "url", "") or
+                                getattr(page, "response_url", "") or url)
+                history = []
+                for item in (getattr(page, "history", None) or []):
+                    history.append({
+                        "status": int(getattr(item, "status_code", 0) or
+                                      getattr(item, "status", 0) or 0),
+                        "url": str(getattr(item, "url", "") or ""),
+                    })
+                headers = getattr(page, "headers", {}) or {}
+                try:
+                    content_type = (headers.get("content-type", "") or
+                                    headers.get("Content-Type", ""))
+                except Exception:
+                    content_type = ""
+                return FetchResult(
+                    html=html,
+                    status=int(getattr(page, "status", 0) or 0),
+                    request_url=url,
+                    final_url=final_url,
+                    redirect_chain=history,
+                    content_type=content_type,
+                    content_length=len(html.encode("utf-8")),
+                    fetched_at=fetched_at,
+                )
             except Exception as e:
                 logger.error(f"HTTP [{url}]: {e}")
-                return None, 0
+                return FetchResult(request_url=url, final_url=url,
+                                   fetched_at=fetched_at)
 
     # ---- 页面去重 ----
     def _cat_key(self, base_url): return base_url.lower().rstrip("/")
@@ -136,8 +198,13 @@ class EmagCrawler:
     # ---- 单页解析 (V2.1.4-final: 一次DOM解析) ----
     def _fetch_and_parse_page(self, name, base_url, page_num, page_url) -> PageResult:
         pr = PageResult(page_number=page_num, page_url=page_url)
-        html, st = self._fetch_page(page_url)
+        fetched = self._fetch_page(page_url)
+        html, st = fetched.html, fetched.status
         pr.http_status = st
+        pr.final_url = fetched.final_url or page_url
+        pr.redirect_chain = fetched.redirect_chain
+        pr.content_type = fetched.content_type
+        pr.content_length = fetched.content_length
 
         # 403/429/511: 不解析DOM, 直接WAF
         if st in (403, 429, 511):
@@ -151,16 +218,19 @@ class EmagCrawler:
             pr.analysis_failed = True
             pr.fatal_error_type = "PAGE_ANALYSIS_ERROR"
             pr.fatal_error_detail = "DOM parse failed"
-            self._log_error(name, page_num, page_url, "PAGE_ANALYSIS_ERROR", detail="DOM parse failed")
-            # DOM解析失败: 用原始HTML简单检查强WAF标题
-            if "emag captcha" in html.lower():
-                pr.waf_error = WafBlockError(200, name, page_num, page_url,
-                    "STRONG_WAF_EVIDENCE", "eMAG Captcha title (text)")
             return pr
 
-        # 强WAF证据检查(使用soup, 仅检查标题)
-        waf3 = detect_waf_block(html, st, page_url, category=name, page_num=page_num, soup=soup)
-        if waf3: pr.waf_error = waf3; return pr
+        title_node = soup.select_one("title")
+        pr.page_title = title_node.get_text(" ", strip=True) if title_node else ""
+
+        # 标题是HTTP 200阶段唯一允许在商品解析前判断的WAF证据。
+        title_waf = detect_waf_block(
+            html, st, page_url, category=name, page_num=page_num,
+            soup=soup, check_title=True, check_body=False)
+        if title_waf:
+            pr.waf_error = title_waf
+            pr.waf_evidence = title_waf.evidence
+            return pr
 
         # 元数据(复用soup)
         pr.next_url = _extract_next_page_soup(soup, page_url) or ""
@@ -174,32 +244,46 @@ class EmagCrawler:
         pr.products_parsed = len(products); pr.parse_failed = len(parse_errors)
         pr.parse_errors = parse_errors; pr.all_products = list(products)
 
-        if not products and not parse_errors:
-            # 无候选卡片: S0-2判断(WAF/空类目/未知页面)
-            # 再次检查正文WAF证据(更全面的检查)
-            page_text = soup.get_text(" ", strip=True).lower()
-            # 明确空类目标记
-            if "niciun produs" in page_text or "nu am gasit" in page_text:
-                pr.is_last_page = True; return pr
-            # 检查WAF正文证据
-            waf_body = _check_body_waf(soup)
-            if waf_body:
-                pr.waf_error = WafBlockError(200, name, page_num, page_url,
-                    "STRONG_WAF_EVIDENCE", f"WAF body evidence: {waf_body}")
-                return pr
-            # 未知页面
-            pr.analysis_failed = True
-            pr.fatal_error_type = "UNKNOWN_HTTP200_PAGE"
-            pr.fatal_error_detail = "No products, no empty-category, no WAF evidence"
+        # 商品解析后再检查真正可见的验证码UI/正文；脚本和隐藏祖先均被排除。
+        body_waf = detect_waf_block(
+            html, st, page_url, category=name, page_num=page_num,
+            soup=soup, check_title=False, check_body=True,
+            has_products=bool(products))
+        if body_waf:
+            pr.waf_error = body_waf
+            pr.waf_evidence = body_waf.evidence
             return pr
 
         if products:
             return pr
 
-        # 全部解析失败
+        if parse_errors:
+            # 调用方会先逐卡写入 errors.csv，再追加页面级错误。
+            pr.analysis_failed = True
+            pr.fatal_error_type = "ALL_PARSE_FAILED"
+            pr.fatal_error_detail = f"All {len(parse_errors)} cards failed to parse"
+            return pr
+
+        # 无候选卡片：只接受明确的可见DOM证据。
+        page_text = get_visible_page_text(soup).lower()
+        pr.empty_evidence = _find_page_marker(page_text, EMPTY_CATEGORY_MARKERS)
+        if pr.empty_evidence:
+            pr.is_last_page = True
+            pr.terminal_reason = "empty_category"
+            return pr
+
+        unavailable = _find_page_marker(page_text, CATEGORY_UNAVAILABLE_MARKERS)
+        if unavailable:
+            pr.empty_evidence = unavailable
+            pr.is_last_page = True
+            pr.terminal_reason = "category_unavailable"
+            return pr
+
         pr.analysis_failed = True
-        pr.fatal_error_type = "ALL_PARSE_FAILED"
-        pr.fatal_error_detail = f"All {len(parse_errors)} cards failed to parse"
+        pr.fatal_error_type = "UNKNOWN_HTTP200_PAGE"
+        pr.fatal_error_detail = "No products, no empty-category, no unavailable-category, no visible WAF evidence"
+        pr.diagnostic_paths = self._save_unknown_http200_diagnostic(
+            name, pr, html)
         return pr
 
     @staticmethod
@@ -211,23 +295,69 @@ class EmagCrawler:
             return None
 
     def _parse_products_soup(self, soup, name, base_url, page_url, page_num):
-        cards = soup.select(".card-item.card-standard.js-product-data")
-        if not cards:
-            cards = soup.select("[data-product-id]")
-            cards = [c for c in cards if c.get("data-product-id")]
+        cards = select_product_cards(soup)
         products, errors = [], []
         for idx, card in enumerate(cards):
             try:
-                from parser import _parse_product_card
                 p = _parse_product_card(card, name, base_url, page_url, page_num)
                 if p: products.append(p)
                 else:
                     pos = card.get("data-position", str(idx+1)); pid = card.get("data-product-id","")
-                    errors.append({"position": pos, "product_id": pid, "error_type": "PARSE_FAILED", "error_detail": "解析返回None"})
+                    fav = card.select_one(".add-to-favorites")
+                    pid = pid or (fav.get("data-productid", "") if fav else "")
+                    errors.append({"position": pos, "product_id": pid,
+                        "url": card.get("data-url", "") or page_url,
+                        "error_type": "PARSE_FAILED", "error_detail": "解析返回None"})
             except Exception as e:
                 pos = card.get("data-position", str(idx+1)); pid = card.get("data-product-id","")
-                errors.append({"position": pos, "product_id": pid, "error_type": type(e).__name__, "error_detail": str(e)[:200]})
+                fav = card.select_one(".add-to-favorites")
+                pid = pid or (fav.get("data-productid", "") if fav else "")
+                errors.append({"position": pos, "product_id": pid,
+                    "url": card.get("data-url", "") or page_url,
+                    "error_type": type(e).__name__, "error_detail": str(e)[:500]})
         return products, errors
+
+    def _save_unknown_http200_diagnostic(self, name, pr: PageResult,
+                                         html: str) -> list[str]:
+        """异常时保存原始HTML和不含认证信息的结构化诊断。"""
+        diag_dir = os.path.join(self.output_dir, "diagnostics")
+        os.makedirs(diag_dir, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        suffix = (pr.html_hash or hashlib.md5(html.encode("utf-8")).hexdigest())[:10]
+        base = f"unknown_http200_page_{stamp}_{suffix}"
+        html_path = os.path.join(diag_dir, base + ".html")
+        json_path = os.path.join(diag_dir, base + ".json")
+
+        tmp_html = html_path + ".tmp"
+        try:
+            with open(tmp_html, "w", encoding="utf-8") as f:
+                f.write(html)
+            os.replace(tmp_html, html_path)
+        finally:
+            if os.path.exists(tmp_html):
+                os.remove(tmp_html)
+
+        write_atomic_json(json_path, {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "category": name,
+            "page": pr.page_number,
+            "request_url": pr.page_url,
+            "final_url": pr.final_url or pr.page_url,
+            "redirect_chain": pr.redirect_chain,
+            "http_status": pr.http_status,
+            "content_type": pr.content_type,
+            "content_length": pr.content_length,
+            "page_title": pr.page_title,
+            "html_hash": pr.html_hash,
+            "candidate_cards": pr.cards_found,
+            "parsed_products": pr.products_parsed,
+            "parse_failed": pr.parse_failed,
+            "empty_evidence": pr.empty_evidence,
+            "waf_evidence": pr.waf_evidence,
+            "fatal_error_type": pr.fatal_error_type,
+            "fatal_error_detail": pr.fatal_error_detail,
+        })
+        return [os.path.abspath(html_path), os.path.abspath(json_path)]
 
     # ---- 类目抓取 ----
     def crawl_category(self, name, url, max_pages=None):
@@ -243,13 +373,16 @@ class EmagCrawler:
         if pr.analysis_failed:
             stats.failed_pages += 1
             stats.stop_reason = pr.fatal_error_type or "page_analysis_error"
+            self._commit_page_errors(name, url, pr)
             self._log_error(name, 1, url, stats.stop_reason, detail=pr.fatal_error_detail)
+            self._report_analysis_failure(name, pr)
             self._run_status = RunStatus.NETWORK_ERROR; return stats
         if pr.http_status != 200:
             stats.failed_pages += 1
             self._handle_stop(RunStatus.NETWORK_ERROR, name, 1, url, detail=f"HTTP {pr.http_status}"); return stats
         if pr.cards_found == 0 and pr.is_last_page:
-            stats.stop_reason = "empty_category"; return stats
+            self._commit_page(name, url, pr, stats)
+            stats.stop_reason = pr.terminal_reason or "empty_category"; return stats
         if pr.cards_found > 0 and pr.products_parsed == 0 and pr.parse_failed > 0:
             self._commit_page_errors(name, url, pr)
             stats.stop_reason = "parse_error"
@@ -296,13 +429,21 @@ class EmagCrawler:
                             self._stop_event.set(); stopped = True; break
                         if pr.analysis_failed:
                             stats.failed_pages += 1; stats.stop_reason = pr.fatal_error_type or "page_analysis_error"
+                            self._commit_page_errors(name, url, pr)
                             self._log_error(name, next_expected, pr.page_url, stats.stop_reason, detail=pr.fatal_error_detail)
+                            self._report_analysis_failure(name, pr)
                             self._run_status = RunStatus.NETWORK_ERROR; stopped = True; break
                         if pr.http_status != 200:
                             stats.failed_pages += 1; stats.stop_reason = "network_error"
                             self._handle_stop(RunStatus.NETWORK_ERROR, name, next_expected, pr.page_url, detail=f"HTTP {pr.http_status}")
                             stopped = True; break
-                        if pr.cards_found == 0: stopped = True; break
+                        if pr.cards_found == 0 and pr.is_last_page:
+                            self._commit_page(name, url, pr, stats)
+                            stats.stop_reason = "actual_last_page_reached"
+                            stopped = True; break
+                        if pr.cards_found == 0:
+                            stats.failed_pages += 1; stats.stop_reason = "UNKNOWN_HTTP200_PAGE"
+                            self._run_status = RunStatus.NETWORK_ERROR; stopped = True; break
                         if pr.cards_found > 0 and pr.products_parsed == 0 and pr.parse_failed > 0:
                             self._commit_page_errors(name, url, pr)
                             self._run_status = RunStatus.NETWORK_ERROR; stopped = True; break
@@ -329,8 +470,12 @@ class EmagCrawler:
     def _commit_page(self, name, base_url, pr: PageResult, stats: CategoryStats):
         self._check_and_add_hash(base_url, pr.html_hash) if pr.html_hash else None
         for err in pr.parse_errors:
-            self._log_error(name, pr.page_number, pr.page_url, err.get("error_type","PARSE_FAILED"),
-                          detail=err.get("error_detail",""), product_key=err.get("product_id",""))
+            self._log_error(name, pr.page_number,
+                err.get("url") or pr.page_url,
+                err.get("error_type","PARSE_FAILED"),
+                detail=err.get("error_detail",""),
+                product_key=err.get("product_id",""),
+                position=err.get("position", ""))
 
         all_prods = pr.all_products
         new_products, dup_count, added_keys = [], 0, []
@@ -355,8 +500,21 @@ class EmagCrawler:
 
     def _commit_page_errors(self, name, base_url, pr: PageResult):
         for err in pr.parse_errors:
-            self._log_error(name, pr.page_number, pr.page_url, err.get("error_type","PARSE_FAILED"),
-                          detail=err.get("error_detail",""), product_key=err.get("product_id",""))
+            self._log_error(name, pr.page_number,
+                err.get("url") or pr.page_url,
+                err.get("error_type","PARSE_FAILED"),
+                detail=err.get("error_detail",""),
+                product_key=err.get("product_id",""),
+                position=err.get("position", ""))
+
+    @staticmethod
+    def _report_analysis_failure(name: str, pr: PageResult):
+        s = __import__('sys')
+        print(f"\n[页面分析失败] 错误类型: {pr.fatal_error_type}", file=s.stderr)
+        print(f"  错误详情: {pr.fatal_error_detail}", file=s.stderr)
+        print(f"  类目: {name}  页码: {pr.page_number}", file=s.stderr)
+        for path in pr.diagnostic_paths:
+            print(f"  诊断文件: {path}", file=s.stderr)
 
     def _make_page_url(self, t, n): return f"{t[0]}{n}{t[1]}" if t else None
 
@@ -374,7 +532,7 @@ class EmagCrawler:
             stats = self.stats.get(cat["name"])
             if stats and stats.stop_reason in (
                 "requested_limit_reached", "actual_last_page_reached",
-                "no_next_page", "empty_category"
+                "no_next_page", "empty_category", "category_unavailable"
             ):
                 with self._cat_urls_lock:
                     self._completed_cat_urls.add(cat["url"])
@@ -408,9 +566,11 @@ class EmagCrawler:
         print(f"  类目: {name}  页码: {page_num}", file=s.stderr)
 
     # ---- 错误 ----
-    ERROR_FIELDNAMES = ["时间","类目","页码","商品键","URL","错误类型","HTTP状态码","重试次数","错误详情"]
-    def _log_error(self, name, page, url, error_type, http_status=0, retries=0, detail="", product_key=""):
+    ERROR_FIELDNAMES = ["时间","类目","页码","卡片位置","商品键","URL","错误类型","HTTP状态码","重试次数","错误详情"]
+    def _log_error(self, name, page, url, error_type, http_status=0, retries=0,
+                   detail="", product_key="", position=""):
         d = {"时间": datetime.now(timezone.utc).isoformat(), "类目": name, "页码": page,
+             "卡片位置": position,
              "商品键": product_key, "URL": url, "错误类型": error_type,
              "HTTP状态码": http_status, "重试次数": retries, "错误详情": detail}
         with self._error_lock:
@@ -481,7 +641,7 @@ class EmagCrawler:
             d = s.to_dict()
             d["completed"] = s.stop_reason in (
                 "requested_limit_reached", "actual_last_page_reached",
-                "no_next_page", "empty_category")
+                "no_next_page", "empty_category", "category_unavailable")
             cat_dicts.append(d)
         summary = {
             "version": "2.1.4", "status": status.value,
@@ -517,32 +677,6 @@ def _extract_next_page_soup(soup, current_url: str) -> str:
             if href and href != "javascript:void(0)": return urljoin(current_url, href)
     return None
 
-def _check_body_waf(soup) -> str:
-    """检查soup正文中强WAF证据 (可见文本+控件)"""
-    from bs4 import NavigableString
-    visible = []
-    for el in soup.select("body *"):
-        try:
-            style = (el.get("style") or "").lower()
-            if "display:none" in style or "display: none" in style: continue
-            if el.get("hidden") is not None: continue
-        except Exception: pass
-        t = el.get_text(strip=True)
-        if t: visible.append(t.lower())
-    body = " ".join(visible)
-    for m in ["please verify you are human", "verify you are human",
-              "human verification", "trafic neobisnuit", "access denied"]:
-        if m in body: return m
-    cc = soup.select("#captcha, .captcha, [class*=captcha], #challenge, .challenge")
-    for c in cc:
-        try:
-            if c.get("hidden") is not None: continue
-            if "display:none" in (c.get("style") or "").lower(): continue
-            return f"captcha container: {c.get('id','') or c.get('class','')}"
-        except Exception: pass
-    return ""
-
-
 def _extract_total_pages_soup(soup):
     import re
     max_page = 0
@@ -557,3 +691,10 @@ def _extract_total_pages_soup(soup):
             if n > max_page: max_page = n
         except ValueError: pass
     return max_page if max_page > 0 else None
+
+
+def _find_page_marker(page_text: str, markers: tuple[str, ...]) -> str:
+    for marker in markers:
+        if marker in page_text:
+            return marker
+    return ""

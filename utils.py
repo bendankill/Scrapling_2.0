@@ -159,8 +159,10 @@ def _category_name_from_url(url: str, index: int) -> str:
 # ============================================================
 def detect_waf_block(html: str, http_status: int, url: str,
                      category: str = "", page_num: int = 0,
-                     soup=None) -> Optional[WafBlockError]:
-    """HTTP 403/429/511无条件阻断。HTTP 200+soup: 强WAF标题优先。soup=None时仅检查标题。"""
+                     soup=None, *, check_title: bool = True,
+                     check_body: bool = True,
+                     has_products: bool = False) -> Optional[WafBlockError]:
+    """权威WAF判断：状态码无条件阻断，HTTP 200仅使用可见DOM证据。"""
     if http_status in (403, 429, 511):
         block_names = {403: "HTTP_403_FORBIDDEN", 429: "HTTP_429_RATE_LIMIT", 511: "HTTP_511_WAF"}
         ep = [f"HTTP {http_status}"]
@@ -172,76 +174,115 @@ def detect_waf_block(html: str, http_status: int, url: str,
     if not html:
         return None
 
-    # HTTP 200: 强WAF证据(标题+正文+可见控件)
-    if soup is not None:
-        title = _get_page_title_soup(soup)
-        if _is_strong_waf_title(title):
-            return WafBlockError(http_status, category, page_num, url, "STRONG_WAF_EVIDENCE", f"Strong WAF title: {title[:60]}")
-        # S0-2: 检查正文中的强WAF证据(可见文本+控件)
-        body_evidence = _soup_strong_waf_body(soup)
-        if body_evidence:
-            return WafBlockError(http_status, category, page_num, url, "STRONG_WAF_EVIDENCE", f"Strong WAF body: {body_evidence[:80]}")
-    else:
+    # 生产流程会传入已构建的 soup；仅兼容独立调用时在这里构建一次。
+    if soup is None:
         try:
             from bs4 import BeautifulSoup
-            s2 = BeautifulSoup(html, "lxml")
-            title = _get_page_title_soup(s2)
-            if _is_strong_waf_title(title):
-                return WafBlockError(http_status, category, page_num, url, "STRONG_WAF_EVIDENCE", f"Strong WAF title: {title[:60]}")
-            body_evidence = _soup_strong_waf_body(s2)
-            if body_evidence:
-                return WafBlockError(http_status, category, page_num, url, "STRONG_WAF_EVIDENCE", f"Strong WAF body: {body_evidence[:80]}")
+            soup = BeautifulSoup(html, "lxml")
         except Exception:
             if "emag captcha" in html.lower():
                 return WafBlockError(http_status, category, page_num, url, "STRONG_WAF_EVIDENCE", "eMAG Captcha title (text)")
-            hl = html.lower()
-            strong_body = ["please verify you are human", "verify you are human",
-                           "human verification", "trafic neobisnuit"]
-            for sb in strong_body:
-                if sb in hl:
-                    return WafBlockError(http_status, category, page_num, url, "STRONG_WAF_EVIDENCE", f"Strong WAF body text: {sb}")
+            return None
+
+    if check_title:
+        title = _get_page_title_soup(soup)
+        if _is_strong_waf_title(title):
+            return WafBlockError(
+                http_status, category, page_num, url,
+                "STRONG_WAF_EVIDENCE", f"Strong WAF title: {title[:60]}")
+
+    if check_body:
+        body_evidence = _soup_strong_waf_body(soup, has_products=has_products)
+        if body_evidence:
+            return WafBlockError(
+                http_status, category, page_num, url,
+                "STRONG_WAF_EVIDENCE", f"Strong WAF body: {body_evidence[:120]}")
     return None
 
 
-def _soup_strong_waf_body(soup) -> str:
-    """检查soup中可见正文是否包含强WAF证据"""
-    # 提取可见文本
-    visible_texts = []
-    for el in soup.select("body *"):
-        if not _is_visible_element(el):
+_NON_VISIBLE_TAGS = frozenset({"script", "style", "noscript", "template", "head"})
+_STRONG_WAF_BODY_MARKERS = (
+    "please verify you are human", "verify you are human",
+    "human verification", "am detectat trafic neobisnuit",
+    "trafic neobisnuit", "trafic neobișnuit",
+)
+
+
+def _has_product_ancestor(el) -> bool:
+    node = el if hasattr(el, "get") else getattr(el, "parent", None)
+    while node is not None:
+        if hasattr(node, "get"):
+            classes = node.get("class") or []
+            if isinstance(classes, str):
+                classes = classes.split()
+            if "js-product-data" in classes and "card-item" in classes:
+                return True
+        node = getattr(node, "parent", None)
+    return False
+
+
+def _visible_text_chunks(soup, *, exclude_product_cards: bool = False) -> list[str]:
+    chunks = []
+    for text_node in soup.find_all(string=True):
+        parent = getattr(text_node, "parent", None)
+        if parent is None or not _is_visible_element(parent):
             continue
-        txt = el.get_text(strip=True)
-        if txt:
-            visible_texts.append(txt.lower())
-    body_lower = " ".join(visible_texts)
-    # 强WAF正文标记
-    strong_markers = [
-        "please verify you are human", "verify you are human",
-        "human verification", "am detectat trafic neobisnuit",
-        "trafic neobisnuit", "access denied",
-    ]
-    for m in strong_markers:
-        if m in body_lower:
-            return m
-    # 可见captcha控件
+        if exclude_product_cards and _has_product_ancestor(parent):
+            continue
+        text = str(text_node).strip()
+        if text:
+            chunks.append(text)
+    return chunks
+
+
+def get_visible_page_text(soup, *, exclude_product_cards: bool = False) -> str:
+    """提取真正可见的页面文本，排除脚本、模板和隐藏祖先。"""
+    return " ".join(_visible_text_chunks(
+        soup, exclude_product_cards=exclude_product_cards))
+
+
+def _soup_strong_waf_body(soup, *, has_products: bool = False) -> str:
+    """检查真正可见且不属于商品卡片的验证码UI和阻断正文。"""
+    # 可见captcha/challenge控件本身就是强证据。
     captcha_containers = soup.select(
         "#captcha, .captcha, [class*=captcha], [id*=captcha], "
-        "#challenge, .challenge, [class*=challenge]"
+        "#challenge, .challenge, [class*=challenge], [id*=challenge]"
     )
     for c in captcha_containers:
-        if _is_visible_element(c):
+        if _is_visible_element(c) and not _has_product_ancestor(c):
             return f"visible captcha/challenge container: {c.get('id','') or c.get('class','')}"
+
+    body_lower = get_visible_page_text(
+        soup, exclude_product_cards=True).lower()
+    for marker in _STRONG_WAF_BODY_MARKERS:
+        if marker in body_lower:
+            return marker
+
+    # access denied 属于弱证据：有真实商品时不能仅凭普通文案终止任务。
+    if not has_products and "access denied" in body_lower:
+        return "access denied"
     return ""
 
 
 def _is_visible_element(el) -> bool:
-    """判断元素是否可见(排除隐藏节点)"""
-    if not hasattr(el, 'get'): return True
-    style = (el.get("style") or "").lower()
-    if "display:none" in style or "display: none" in style: return False
-    if "visibility:hidden" in style or "visibility: hidden" in style: return False
-    if el.get("hidden") is not None: return False
-    if el.get("aria-hidden") == "true": return False
+    """判断元素及全部祖先是否可见。"""
+    node = el if hasattr(el, "get") else getattr(el, "parent", None)
+    while node is not None:
+        name = (getattr(node, "name", "") or "").lower()
+        if name in _NON_VISIBLE_TAGS:
+            return False
+        if hasattr(node, "get"):
+            style = (node.get("style") or "").lower()
+            if re.search(r"display\s*:\s*none", style):
+                return False
+            if re.search(r"visibility\s*:\s*hidden", style):
+                return False
+            if node.get("hidden") is not None:
+                return False
+            aria_hidden = str(node.get("aria-hidden") or "").strip().lower()
+            if aria_hidden == "true":
+                return False
+        node = getattr(node, "parent", None)
     return True
 
 
@@ -258,22 +299,6 @@ def _is_strong_waf_title(title: str) -> bool:
 def _get_page_title_soup(soup) -> str:
     t = soup.select_one("title")
     return t.get_text(strip=True) if t else ""
-
-
-def _page_has_valid_product_soup(soup) -> bool:
-    """统一商品卡片判断: 使用已解析soup检查有效商品卡片"""
-    from bs4 import Tag
-    cards = soup.select(".card-item.card-standard.js-product-data")
-    if not cards:
-        cards = soup.select("[data-product-id]")
-    for card in cards:
-        if not isinstance(card, Tag): continue
-        pid = (card.get("data-product-id") or "").strip()
-        title = (card.get("data-name") or "").strip()
-        url = (card.get("data-url") or "").strip()
-        if pid and title and url and "/pd/" in url:
-            return True
-    return False
 
 
 # 保持旧函数名兼容

@@ -22,6 +22,15 @@ from utils import parse_romanian_price
 logger = logging.getLogger("emag_crawler.parser")
 
 
+def select_product_cards(soup: BeautifulSoup) -> list[Tag]:
+    """返回真实商品卡片，兼容 standard/fashion 等 eMAG 卡片类型。"""
+    cards = soup.select(".card-item.js-product-data")
+    if cards:
+        return cards
+    return [card for card in soup.select("[data-product-id]")
+            if card.get("data-product-id")]
+
+
 def parse_product_listing(
     html: str,
     category_name: str = "",
@@ -37,10 +46,7 @@ def parse_product_listing(
     soup = BeautifulSoup(html, "lxml")
     products = []
 
-    cards = soup.select(".card-item.card-standard.js-product-data")
-    if not cards:
-        cards = soup.select("[data-product-id]")
-        cards = [c for c in cards if c.get("data-product-id")]
+    cards = select_product_cards(soup)
 
     logger.debug(f"页面找到 {len(cards)} 个商品卡片")
 
@@ -112,6 +118,12 @@ def _parse_product_card(
 
     if not pnk:
         pnk = fav_data.get("pnk", "")
+
+    # fashion 卡片不在根节点提供 data-product-id，改从收藏按钮 JSON 回填。
+    if not product_id:
+        product_id = str(fav_data.get("productid") or fav_data.get("product_id") or "")
+    if not offer_id:
+        offer_id = str(fav_data.get("offerid") or fav_data.get("offer_id") or "")
 
     currency = fav_data.get("currency", "RON")
 
