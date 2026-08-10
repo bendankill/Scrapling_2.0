@@ -2,12 +2,16 @@
 导出模块：商品数据导出为 CSV、XLSX、标准 JSON (数组)
 """
 import csv
-import json
 import logging
 import os
 from threading import Lock
 
 from models import ProductItem
+from output_schema import (
+    max_category_level,
+    output_columns,
+    product_to_output_dict,
+)
 from utils import write_atomic_json
 
 logger = logging.getLogger("emag_crawler.exporters")
@@ -57,43 +61,36 @@ class Exporters:
             return len(self._products)
 
     def get_csv_buffer(self) -> list[dict]:
-        """获取用于 CSV/XLSX 导出的数据 (extra 转为 JSON 字符串)"""
+        """获取用于 CSV/XLSX 导出的中文数据 (扩展信息转为 JSON 字符串)"""
         sorted_prods = self.get_products_sorted()
-        result = []
-        for d in sorted_prods:
-            row = dict(d)
-            if isinstance(row.get("extra"), dict):
-                row["extra"] = json.dumps(row["extra"], ensure_ascii=False) if row["extra"] else ""
-            result.append(row)
-        return result
+        return [product_to_output_dict(product, stringify_extra=True) for product in sorted_prods]
+
+    def get_json_buffer(self) -> list[dict]:
+        """获取 products.json 使用的中文数据，扩展信息保持 object。"""
+        return [product_to_output_dict(product) for product in self.get_products_sorted()]
 
     def write_json(self) -> None:
         """写入标准 products.json (JSON 数组, 原子写入)"""
-        sorted_prods = self.get_products_sorted()
-        # extra 在 JSON 中保持为 object
-        write_atomic_json(self.json_path, sorted_prods)
-        logger.info(f"JSON 已写入: {self.json_path} ({len(sorted_prods)} 条)")
+        buffer = self.get_json_buffer()
+        write_atomic_json(self.json_path, buffer)
+        logger.info(f"JSON 已写入: {self.json_path} ({len(buffer)} 条)")
 
     def _write_csv(self) -> None:
         """写入 CSV (UTF-8 BOM)"""
         buffer = self.get_csv_buffer()
+        columns = output_columns(max_category_level(buffer))
         if not buffer:
             # 至少创建表头
-            columns = ProductItem.csv_columns()
-            field_names = ProductItem.field_names()
             with open(self.csv_path, "w", encoding="utf-8-sig", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=field_names, extrasaction="ignore")
-                writer.writerow(dict(zip(field_names, columns)))
+                writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+                writer.writeheader()
             logger.info(f"CSV 已写入(仅表头): {self.csv_path}")
             return
 
-        columns = ProductItem.csv_columns()
-        field_names = ProductItem.field_names()
         with open(self.csv_path, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=field_names, extrasaction="ignore")
-            writer.writerow(dict(zip(field_names, columns)))
-            for row in buffer:
-                writer.writerow(row)
+            writer = csv.DictWriter(f, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(buffer)
         logger.info(f"CSV 已写入: {self.csv_path} ({len(buffer)} 行)")
 
     def _write_xlsx(self) -> None:
@@ -111,20 +108,21 @@ class Exporters:
         ws = wb.active
         ws.title = "商品数据"
 
-        columns = ProductItem.excel_columns()
+        columns = output_columns(max_category_level(buffer))
         header_fill = PatternFill(start_color="005EB8", end_color="005EB8", fill_type="solid")
         header_font = Font(bold=True, size=11, color="FFFFFF")
 
-        for col_idx, (col_name, _) in enumerate(columns, 1):
+        for col_idx, col_name in enumerate(columns, 1):
             cell = ws.cell(row=1, column=col_idx, value=col_name)
             cell.font = header_font
             cell.fill = header_fill
             cell.alignment = Alignment(horizontal="center")
 
         if buffer:
-            price_fields = {"price_current", "price_old", "price_promo"}
+            price_fields = {"前端价格", "PRP原价", "活动价格"}
+            integer_fields = {"前端折扣", "评价数量", "页码", "页内位置", "HTTP状态码"}
             for row_idx, item in enumerate(buffer, 2):
-                for col_idx, (_, field_name) in enumerate(columns, 1):
+                for col_idx, field_name in enumerate(columns, 1):
                     value = item.get(field_name, "")
                     cell = ws.cell(row=row_idx, column=col_idx)
                     if field_name in price_fields and value is not None and value != "":
@@ -133,21 +131,32 @@ class Exporters:
                             cell.number_format = '#,##0.00'
                         except (ValueError, TypeError):
                             cell.value = str(value) if value is not None else ""
-                    elif field_name in ("discount_percent", "rating", "review_count",
-                                        "page_number", "position_in_page", "http_status"):
+                    elif field_name in integer_fields:
                         try:
                             cell.value = int(value) if value is not None and value != "" else value
                         except (ValueError, TypeError):
                             cell.value = str(value) if value is not None else ""
+                    elif field_name == "评论分数" and value is not None and value != "":
+                        try:
+                            cell.value = float(value)
+                        except (ValueError, TypeError):
+                            cell.value = str(value)
                     else:
                         cell.value = str(value) if value is not None else ""
 
         ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{max(len(buffer) + 1, 2)}"
         ws.freeze_panes = "A2"
 
-        col_widths = {1: 16, 10: 45, 11: 65, 12: 12, 13: 18, 14: 12, 15: 18, 24: 30, 28: 70, 29: 50, 30: 22, 33: 40}
-        for col_idx, width in col_widths.items():
-            ws.column_dimensions[get_column_letter(col_idx)].width = width
+        col_widths = {
+            "类目名称": 16, "产品标题": 45, "产品链接": 65,
+            "前端价格": 12, "前端价格原文": 18, "PRP原价": 12,
+            "PRP原价原文": 18, "配送信息": 30, "产品图片": 70,
+            "本地图片路径": 50, "抓取时间": 22, "扩展信息": 40,
+        }
+        for field_name, width in col_widths.items():
+            if field_name in columns:
+                col_idx = columns.index(field_name) + 1
+                ws.column_dimensions[get_column_letter(col_idx)].width = width
 
         wb.save(self.xlsx_path)
         logger.info(f"XLSX 已写入: {self.xlsx_path} ({len(buffer)} 行)")
@@ -160,7 +169,7 @@ class Exporters:
 
 
 def _product_to_json_dict(product: ProductItem) -> dict:
-    """将 ProductItem 转为适合 JSON 输出的 dict (extra 保持为 object)"""
+    """将 ProductItem 转为内部英文 dict；最终中文化只在写文件时发生。"""
     from dataclasses import asdict
     d = asdict(product)
     # JSON 中 extra 保持为原始 dict, 不被二次编码

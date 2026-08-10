@@ -83,51 +83,17 @@ class ProductItem:
         return d
 
     @staticmethod
-    def excel_columns() -> list:
-        """返回 Excel 列名和字段映射"""
-        return [
-            ("类目名称", "category_name"),
-            ("类目URL", "category_url"),
-            ("来源页面", "source_page_url"),
-            ("页码", "page_number"),
-            ("页面位置", "position_in_page"),
-            ("商品ID", "product_id"),
-            ("PNK", "pnk"),
-            ("SKU", "sku"),
-            ("Offer ID", "offer_id"),
-            ("商品标题", "title"),
-            ("商品URL", "product_url"),
-            ("当前售价", "price_current"),
-            ("当前售价(原始)", "price_current_raw"),
-            ("原价", "price_old"),
-            ("原价(原始)", "price_old_raw"),
-            ("活动价", "price_promo"),
-            ("活动价(原始)", "price_promo_raw"),
-            ("折扣百分比", "discount_percent"),
-            ("货币", "currency"),
-            ("库存状态", "availability"),
-            ("库存文本", "stock_text"),
-            ("卖家", "seller"),
-            ("品牌", "brand"),
-            ("标签", "badges"),
-            ("活动名称", "campaign_name"),
-            ("配送信息", "shipping_text"),
-            ("评分", "rating"),
-            ("评论数", "review_count"),
-            ("主图URL", "main_image_url"),
-            ("主图本地路径", "main_image_local_path"),
-            ("采集时间", "collected_at"),
-            ("HTTP状态", "http_status"),
-            ("解析来源", "parse_source"),
-            ("额外字段", "extra"),
-        ]
+    def excel_columns(max_category_level: int = 0) -> list:
+        """兼容旧接口；列定义由唯一产品输出映射表提供。"""
+        from output_schema import output_column_pairs
+        return output_column_pairs(max_category_level)
 
     @staticmethod
-    def csv_columns() -> list:
+    def csv_columns(max_category_level: int = 0) -> list:
         """返回 CSV 列名"""
-        return [col[0] for col in ProductItem.excel_columns()]
+        return [col[0] for col in ProductItem.excel_columns(max_category_level)]
 
     @staticmethod
-    def field_names() -> list:
-        """返回字段名列表"""
-        return [col[1] for col in ProductItem.excel_columns()]
+    def field_names(max_category_level: int = 0) -> list:
+        """返回统一输出字段名列表"""
+        return ProductItem.csv_columns(max_category_level)

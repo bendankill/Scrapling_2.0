@@ -644,7 +644,7 @@ class EmagCrawler:
                 "no_next_page", "empty_category", "category_unavailable")
             cat_dicts.append(d)
         summary = {
-            "version": "2.1.4", "status": status.value,
+            "version": "2.2.0", "status": status.value,
             "start_time": datetime.fromtimestamp(self.start_time, tz=timezone.utc).isoformat(),
             "end_time": datetime.now(timezone.utc).isoformat(),
             "elapsed_seconds": round(total_elapsed, 2),

@@ -210,7 +210,7 @@ class TestHttp200Classification:
         data = json.load(open(os.path.join(output, "products.json"), encoding="utf-8"))
         assert crawler.get_exit_code() == 0
         assert summary["totals"]["total_records"] == 1
-        assert data[0]["title"] == "Fallback Fixture Title"
+        assert data[0]["产品标题"] == "Fallback Fixture Title"
 
     def test_tricouri_real_structure_fixture_is_exact_product_page(self):
         path = os.path.join(os.path.dirname(__file__), "fixtures",
@@ -243,7 +243,7 @@ class TestHttp200Classification:
         assert summary["totals"]["completed_categories"] == 3
         assert summary["totals"]["total_records"] == 3
         assert server.request_count("/b/c") == 1
-        assert {item["title"] for item in data} == {"A", "Tricou sport Fixture", "B"}
+        assert {item["产品标题"] for item in data} == {"A", "Tricou sport Fixture", "B"}
 
     def test_all_cards_failed_writes_each_error_then_page_error(
             self, server, tmp_path, monkeypatch):
@@ -334,7 +334,7 @@ class TestHttp200Classification:
         assert summary["status"] == "waf_blocked"
         assert summary["totals"]["completed_categories"] == 1
         assert len(data) == 1
-        assert data[0]["title"] == "A"
+        assert data[0]["产品标题"] == "A"
         assert server.request_count("/c/c") == 0
 
 
