@@ -1,106 +1,202 @@
-# Scrapling V2.2.0 归档与 V2.2.1 类目层级完善任务报告
+# Scrapling V2.2.1 类目层级准确性 S1 修复报告
 
 ## 1. 完成状态
 
-**自动化开发、测试、实际写盘和推送已完成；真实 HTTP 验证因 WAF 阻断暂未完成。**
+自动化修复、生产调用链验证、并发验证、三格式写盘、文档更新、功能提交和推送均已完成。V2.2.1 仍标记为“开发中/待 ChatGPT 验收”，不是稳定版。
 
-V2.2.0 已按验收 SHA 归档，GitHub 默认主页已用 main 独立纯文档提交更新。V2.2.1 已从最终 V2.2.0 创建，完成列表页真实类目证据提取、线程安全旁路缓存、跨页复用、三格式导出和版本更新。
+真实 HTTP 验证未完成：当前环境中的 Scrapling 会话在获得 eMAG HTTP 响应前报出 `No active session available`（HTTP 0）。本报告不把该结果记为 eMAG 页面或 WAF 验证通过。
 
-## 2. V2.2.0 最终归档 SHA
+## 2. 当前分支
 
-`5c444806b382b56c13c7afe5eaab31d94288afdc`
+`V2.2.1`
 
-任务开始、本任务功能提交后和最终核验时，`origin/V2.2.0` 均保持该 SHA。V2.2.0 没有遗漏的项目代码、测试或报告，因此没有制造空提交。
+## 3. 修复前完整 SHA
 
-## 3. GitHub 默认主页 main 更新前后 SHA
+`de9b1107216ec6f361876008baed8e8506597da7`
 
-- 更新前：`75500e45d244b61854de553eedbaad21e9d3005d`
-- 更新后：`383c1e8fdf38f75c257558ac42786faf2f567604`
-- 提交：`docs: archive V2.2.0 and announce V2.2.1 development`
+## 4. 修复后功能完整 SHA
 
-main 只修改 `README.md` 和 `CHANGELOG.md`，没有合并或修改 V2.2.0 生产代码。README 明确 V2.2.0 是当前稳定版本，V2.2.1 是开发分支，并提供两个分支链接。
+`ee8667ce5e4ec82f9b1297b1fae5be12b27d725c`
 
-## 4. V2.2.1 创建基线 SHA
+提交：`fix: harden V2.2.1 category hierarchy accuracy`
 
-- V2.2.0 唯一基线：`5c444806b382b56c13c7afe5eaab31d94288afdc`
-- V2.2.1 创建时本地 SHA：`5c444806b382b56c13c7afe5eaab31d94288afdc`
-- V2.2.1 初始远程 SHA：`5c444806b382b56c13c7afe5eaab31d94288afdc`
+本报告在功能提交之后单独提交，因此最终发布 HEAD 以报告提交完成后的本地/远程核验值为准。
 
-V2.2.1 未从 main 或其他历史分支创建。
+## 5. 本地与远程是否一致
 
-## 5. V2.2.1 最终功能完整 SHA
+功能提交推送后，本地 `HEAD` 与 `origin/V2.2.1` 均为 `ee8667ce5e4ec82f9b1297b1fae5be12b27d725c`。报告提交后会再次核对最终 HEAD。
 
-`237b5338f7955f4d0bc5c777ebb303f7f0127789`
+## 6. 是否已推送
 
-提交：`feat: extract verified category hierarchy for V2.2.1`
+是。使用普通推送，没有强制推送、合并 main、创建 PR 或标签。
 
-本报告在功能 SHA 产生后单独提交，以便准确记录功能提交。最终包含报告的发布 HEAD 由任务结束时的本地与远程 SHA 核验结果确定。
+## 7. config/categories.txt 是否未修改
 
-## 6. 本地与远程是否一致
+Codex 未编辑、恢复、暂存或提交 `config/categories.txt`。它继续作为老大的工作区修改保留，当前 SHA-1 为 `b11babeab1ff76982395c87173d4147fdc4e0085`，不属于本次提交。
 
-功能提交推送后，本地 V2.2.1 与 `origin/V2.2.1` 均为 `237b5338f7955f4d0bc5c777ebb303f7f0127789`。报告提交后再次核对最终发布 HEAD。
+未发现并且未创建 `config/categories - 副本.txt1`；所有 `output/`、临时配置和运行产物均未提交。
 
-## 7. 是否已推送
+## 8. 三个 S1 问题根因
 
-是。
+1. **S1-1 无关 breadcrumb**：旧逻辑宽泛扫描任意属性中含 `breadcrumb` 的节点，并把 URL/H1 当作可向任意父链追加当前类目的授权；候选又先按长度排序，因此更长帮助导航可能获胜。
+2. **S1-2 短页面路径覆盖**：旧 `select_product_category_levels()` 一收到页面旁路层级就立即返回，没有与商品 `favorite_data.category_trail` 和 `data-category-trail` 共同比较。
+3. **S1-3 缓存锁死**：crawler 发现任何缓存就直接返回；虽然 Registry 能替换较短路径，后续页面证据却永远没有机会进入 Registry。
 
-- V2.2.1 初始分支已通过普通推送创建并设置跟踪。
-- 功能提交已普通快进推送。
-- main 文档提交已普通快进推送。
-- 没有强制推送、合并生产代码、创建 PR 或标签。
+## 9. 无关 breadcrumb 复现修复前后
 
-## 8. config/categories.txt 是否保持不变
+输入：URL `/boxe/c`、H1 `Boxe`、可见导航 `eMAG / Contul meu / Ajutor comenzi`。
 
-是。Codex 没有修改、恢复、暂存或提交该文件。
+- 修复前：`Contul meu / Ajutor comenzi / Boxe`
+- 修复后：拒绝页面路径，返回 `None`；URL/H1 不再授权追加。
 
-任务开始、分支切换、全部测试、真实验证和功能提交后的哈希均为：
+## 10. 多 breadcrumb 冲突修复前后
 
-`7732ac1747d3f708630105b8eb1cdb7513c2e74d`
+同时存在 `eMAG / TV / Audio / Boxe` 和更长的 `eMAG / Contul meu / Ajutor / Comenzi / Livrare`：
 
-真实 HTTP 验证使用 `output/` 临时配置，结束后已删除。
+- 修复前：错误选择更长帮助路径并追加 `Boxe`
+- 修复后：选择具有连续 `.../c` 类目链接的 `TV / Audio / Boxe`
+- 两条互相冲突且都具有独立高可信类目证据时：放弃页面旁路证据，不按长度或来源序号猜测。
 
-## 9. 用户备份文件是否保持不变
+## 11. 短页面路径覆盖商品完整路径修复前后
 
-任务开始时工作区没有检测到 `config/categories - 副本.txt1`。Codex 没有创建、删除、恢复或提交该文件，也没有处理任何其他用户配置备份。
+页面 `Audio / Boxe`，商品 `TV, Audio-Video & Foto / Audio HI-FI & Profesionale / Audio Hi-Fi / Boxe`：
 
-## 10. 当前问题根因
+- 修复前：输出两级 `Audio / Boxe`
+- 修复后：保留商品四级完整路径
 
-V2.2.0 只在最终导出时读取商品卡已有：
+页面与商品路径现在进入同一选择流程；相互一致时选择更完整链，冲突时短页面链不能删除完整商品链。
 
-1. `extra.favorite_data.category_trail`
-2. `extra["data-category-trail"]`
+## 12. 缓存升级修复前后
 
-商品卡路径本身可能省略中间类目，例如缺少 `Audio Hi-Fi`。crawler 已经为每个 HTTP 200 页面创建唯一 Soup，但旧调用链没有从该 Soup 读取页面级面包屑、JSON-LD 或嵌入状态，因此更完整的页面证据无法进入导出边界。
+第一页两级临时候选 `Audio / Boxe`，第二页四级类目链接证据：
 
-## 11. 最终类目层级数据来源
+- 修复前：缓存一直为两级
+- 修复后：升级为 `TV, Audio-Video & Foto / Audio HI-FI & Profesionale / Audio Hi-Fi / Boxe`
+- 后续较短、低可信或冲突路径均不能覆盖最终四级证据。
 
-页面级来源：
+## 13. 最终证据数据结构
 
-1. 可见面包屑 DOM，包括 schema.org microdata。
-2. JSON-LD `BreadcrumbList`。
-3. 明确 JSON/初始化状态中的 `categoryPath`、`categoryTrail`、`breadcrumbs` 等类目路径。
+`CategoryPathEvidence` 保存：
 
-页面来源不存在或无法通过当前类目校验时，保持原有回退：
+- `levels`
+- `source`
+- `reliability`
+- `current_category_explicit`
+- `current_category_appended`
+- `category_links_verified`
+- `structured_breadcrumb`
+- `is_tentative`
+- `validation_reason`
 
-4. `extra.favorite_data.category_trail`
-5. `extra["data-category-trail"]`
+## 14. 父级追加当前类目的严格条件
 
-唯一一次线上 eMAG 请求返回 HTTP 511，所以本次无法确认当前线上 Boxe HTML 实际采用上述哪一种页面来源。页面结构支持通过标准化 fixture 和动态端口本地 HTTP 生产调用链验证，未冒充为线上证据。
+只有父节点全部具有明确 eMAG 类目 URL（路径以 `/c` 结束）或明确类目 ID，才允许把可靠当前类目补到父链末级。URL slug 或 H1 只能确认当前页面名称，不能验证任意父链。
 
-## 12. 数据源优先级和一致性规则
+footer、隐藏祖先、script、template、noscript、head、仅 `data-testid` 名称和带非类目父链接的路径均被拒绝。
 
-- 所有候选先去除空段、网站根节点 `eMAG`、`Acasă`、`Home` 和重复层级。
-- 当前类目已经出现在路径中时，必须位于末级，否则拒绝。
-- 面包屑只提供父链时，仅在当前类目可由类目 URL、`h1`、`aria-current=page` 或明确类目标识确认时补入末级。
-- 多来源不拼接，选择通过校验的单条路径。
-- 页面候选先比较完整层级数，再比较来源可靠性；同等完整度时可见面包屑/JSON-LD 高于嵌入状态。
-- 页面旁路证据优先于卡片路径；无有效页面证据才回退卡片。
-- 一致性标准化忽略大小写、标点、连字符、罗马尼亚语重音和多余空格。
-- 所有来源均不一致时不输出猜测层级。
+## 15. 候选路径一致性规则
 
-## 13. Boxe 示例完整层级实际输出
+- 两条路径末级必须标准化一致。
+- 较短路径必须按原顺序成为较长路径的子序列。
+- 一致路径可选择更完整链，不拼接两条独立路径。
+- 当前类目位于中间而非末级时拒绝。
+- 大小写、重音、标点、连字符和多余空格按既有标准化规则比较。
 
-生产 `Exporters.finalize()` 的动态本地 HTTP 与独立实际写盘均得到：
+## 16. 可靠性与完整度排序规则
+
+- 先判断是否为真实类目证据，再判断一致性。
+- 一致路径才允许用完整度补层级。
+- 冲突时最终/类目链接/结构化证据优先于临时候选。
+- 两条独立高可信路径冲突时返回无页面证据。
+- 低可信长路径不能仅凭长度覆盖高可信冲突路径。
+- 页面短路径不覆盖更完整商品原路径。
+
+## 17. 缓存临时候选和最终证据规则
+
+- 嵌入 JSON、无类目链接的显式叶子等标记为临时候选。
+- 经父级类目链接验证的可见 breadcrumb 或 JSON-LD 标记为最终证据。
+- 临时候选每类目最多进行 3 次页面升级扫描。
+- 最终证据直接跨页复用，避免重复高成本扫描。
+- Registry 在 `RLock` 内原子比较；允许一致的更完整升级和临时到最终升级，禁止降级与冲突覆盖。
+- 不同规范化 category URL 使用独立缓存键和 crawler 锁。
+
+## 18. 是否新增 HTTP 请求
+
+否。只复用 crawler 已获得的列表页 Soup；不请求详情页、breadcrumb API 或类目树 API。
+
+## 19. 每页 Soup 解析次数
+
+HTTP 200 页面严格为 1 次；403/429/511 保持 0 次。没有重新解析同一 HTML。
+
+## 20. 每页类目提取次数
+
+每页最多 1 次，60 张商品卡不会触发 60 次提取。最终缓存后的分页为 0 次；临时候选允许后续页面每页 1 次、每类目总计最多 3 次升级检查。
+
+## 21. 修改文件清单
+
+- `category_hierarchy.py`
+- `crawler.py`
+- `exporters.py`
+- `output_schema.py`
+- `tests/fixtures/v221_boxe_listing_minimal.html`
+- `tests/test_v221_category_hierarchy.py`
+- `tests/test_v221_category_accuracy_s1.py`（新增）
+- `README.md`
+- `CHANGELOG.md`
+- `TASK_REPORT_V2.2.1.md`
+
+## 22. 新增测试名称和关键断言
+
+新增 30 项测试，集中在 `tests/test_v221_category_accuracy_s1.py`：
+
+- `TestS1UnrelatedBreadcrumbs`：10 项，覆盖 URL/H1 错误授权、帮助导航、更长帮助链、data-testid、footer、隐藏/template、类目链接追加和 JSON-LD 正反例。
+- `TestS1EvidenceConflictRules`：7 项，覆盖可靠性优先、一致扩展、两条高可信冲突、多个嵌入路径、末级校验与子序列判断。
+- `TestS1PageProductComparison`：5 项，覆盖页面两级与商品四级、页面补中间层级、冲突回退和三来源回退。
+- `TestS1CrawlerCacheUpgrade`：7 项，使用真实 crawler 方法覆盖升级、禁止降级、冲突保护、同类目/不同类目并发和 3 次扫描上限。
+- `TestS1ProductionWrite`：1 项，真实调用 `Exporters.finalize()` 并回读三格式，校验四级、BOM、数值类型、extra、ProductItem 不变和顶层白名单。
+
+旧测试未删除，断言未放宽；两项旧“普通父文字可仅靠 H1 追加”的断言按 S1 新规则改为“拒绝”或补充真实类目链接证据。
+
+## 23. 专项测试结果
+
+- V2.2.1 类目 + S1：`68 passed, 41 warnings, 0 failed`
+- V2.2.0 中文导出 + V2.2.1 类目/S1 相关回归：`100 passed, 41 warnings, 0 failed`
+- 警告仅为 lxml/BeautifulSoup `strip_cdata` 弃用提示。
+
+## 24. 两次完整测试结果
+
+- 第一次：`304 passed, 269 warnings, 0 failed in 116.57s`
+- 第二次：`304 passed, 269 warnings, 0 failed in 115.94s`
+- 修复前基线：`274 passed`
+- 净新增：30 项测试
+
+## 25. 并发测试三连结果
+
+连续三次均为：`5 passed, 63 deselected, 7 warnings, 0 failed`，耗时分别为 0.72s、0.69s、0.70s。
+
+## 26. pip check、编译和 diff 检查
+
+- `pip check`：`No broken requirements found.`
+- 对全部 Git 跟踪 Python 文件执行 `python -m py_compile`：退出码 0
+- `git diff --check`：退出码 0
+- 暂存文件敏感信息扫描：未发现 Cookie、Authorization、Bearer、Token 或 API key
+
+## 27. JSON/CSV/XLSX 实际写盘数量
+
+独立生产 `Exporters.finalize()` 写盘回读：
+
+- products.json：1
+- products.csv：1
+- products.xlsx：1
+- CSV UTF-8 BOM：存在
+- JSON extra：对象
+- XLSX 价格/评分/评价数量：数值类型
+
+动态端口本地 HTTP 生产集成测试也为三格式各 1 条、单页请求 1 次。
+
+## 28. Boxe 示例实际输出
+
+本地合法 fixture、真实 crawler/Exporter 调用链和独立写盘均输出：
 
 - 一级类：`TV, Audio-Video & Foto`
 - 二级类：`Audio HI-FI & Profesionale`
@@ -108,185 +204,62 @@ V2.2.0 只在最终导出时读取商品卡已有：
 - 四级类：`Boxe`
 - 五级类：不输出
 
-这是本地合法 fixture 经 crawler 单次 Soup、商品解析、旁路注册和真实三格式写盘得到的结果。线上真实请求被 HTTP 511 阻断，不能声称线上 Boxe 已验证出该路径。
+没有硬编码 `Audio Hi-Fi` 或 Boxe 人工映射；值来自测试页面的类目链接/结构化证据。
 
-## 14. 一至五级处理规则
+## 29. 非类目字段一致性结果
 
-- 路径先完整清理和末级校验，再最多输出前五级。
-- 一级只输出一级；不足五级时 JSON 不生成空的后续键。
-- CSV/XLSX 按整批商品最高真实层级生成动态列，单条不足部分留空。
-- 六级及以上先用完整末级验证，然后只输出前五级，不增加六级类。
-- 空字符串、重复分隔符和重复类目不成为有效层级。
-- 不写死 `Audio Hi-Fi`、Boxe 映射或任何人工类目表。
+ProductItem 和内部英文商品字典在导出前后深度相等；原始 extra 未写入旁路字段。PNK、ID、标题、URL、价格、库存、品牌、标签、链接打标、评分、评价数、图片和采集元数据均未改变。除一级至五级类外没有新产品顶层字段。
 
-## 15. 是否新增 HTTP 请求
+## 30. 真实 HTTP 验证结果
 
-否。
-
-只分析 crawler 已经获取的列表页响应，不请求商品详情页，不增加面包屑 API、类目树 API 或额外页面。动态本地 HTTP 集成测试明确断言单页请求数为 1。
-
-## 16. 每页 Soup 解析次数
-
-- HTTP 200 商品页：严格 1 次。
-- HTTP 403/429/511：0 次，保持既有逻辑。
-- 类目证据函数直接接收 crawler 已创建的 Soup，不重新解析 HTML。
-- 60 张商品卡性能测试实际计数：fetch=1、Soup=1、层级提取=1。
-
-## 17. 类目层级是否按页面提取一次
-
-是，每个页面最多调用一次类目证据提取；不会按商品重复提取。
-
-同一类目一旦取得有效旁路证据，后续分页直接复用缓存，不再扫描面包屑或 JSON 脚本。若前页没有任何有效证据，后续页面可以在自己的现有 Soup 上尝试一次，但仍不增加 DOM 解析或 HTTP 请求。
-
-## 18. 线程安全和跨类目隔离实现
-
-- `CategoryLevelRegistry` 使用 `RLock` 保护按规范化 URL 存储的不可变证据。
-- query 参数、`www.` 和分页段不影响同类目命中。
-- 不同主机、端口或类目路径使用不同键。
-- crawler 使用“类目 URL → 独立 Lock”的双重检查，阻止同类目并发页面重复提取。
-- 后到的较短路径不能覆盖先到的完整路径；同长度时只有更可靠来源可以替换。
-- 两类目并发和同类目 20 线程专项测试均通过，没有串用。
-
-## 19. 修改文件清单
-
-V2.2.1 分支：
-
-- `category_hierarchy.py`：页面证据提取、统一校验、候选选择、URL/名称标准化和线程安全注册表。
-- `crawler.py`：在唯一 Soup 上按类目提取或复用旁路证据。
-- `exporters.py`：线程安全注册/查询旁路证据，并传入统一产品导出边界。
-- `output_schema.py`：接受可选已验证层级，缺失时回退原 extra。
-- `main.py`、`VERSION`、crawler summary：版本更新为 2.2.1。
-- `README.md`、`CHANGELOG.md`：V2.2.1 开发日志和验证结果。
-- `tests/fixtures/v221_boxe_listing_minimal.html`：脱敏最小列表页结构。
-- `tests/test_v221_category_hierarchy.py`：38 项专项测试。
-- `tests/test_v220_chinese_exports.py`：run_summary 版本断言更新为 2.2.1。
-- `TASK_REPORT_V2.2.1.md`：本报告。
-
-main 分支只修改 README/CHANGELOG。
-
-## 20. 新增测试名称和关键断言
-
-新增 38 个 pytest 用例，分为：
-
-- `TestPageEvidenceSources`：可见面包屑、JSON-LD、嵌入状态、父链补叶子、已有叶子不重复、更完整来源选择、不一致拒绝、隐藏面包屑拒绝、根节点和名称标准化。
-- `TestCandidateFallbackAndBoundaries`：页面旁路优先、两级原有回退、不一致回退、一级至六级、空白、罗马尼亚语和去重。
-- `TestRegistryConcurrencyAndIsolation`：URL 规范化、不同类目隔离、完整路径保护、更完整/更可靠替换和多线程注册。
-- `TestCrawlerPerformanceAndReuse`：60 卡单 Soup 单提取、同类目多页复用、同类目并发只提取一次、不同类目并发隔离。
-- `TestProductionWriteAndDataIntegrity`：动态端口本地 HTTP、请求数=1、JSON/CSV/XLSX 回读、四级动态列、数值类型、BOM、extra 和全部非类目字段不变。
-
-没有删除旧测试、降低断言、使用 `pass` 或在测试中复制生产算法。
-
-## 21. 专项测试结果
-
-- V2.2.1 专项：`38 passed, 17 warnings, 0 failed in 1.25s`
-- V2.2.0 中文导出 + V2.2.1 专项最终组合：`70 passed, 17 warnings, 0 failed in 1.51s`
-- parser/crawler/exporter/WAF/分页相关回归：`161 passed, 234 warnings, 0 failed in 38.18s`
-
-## 22. 两次完整测试结果
-
-- 第 1 次：`274 passed, 245 warnings, 0 failed in 117.54s`
-- 第 2 次：`274 passed, 245 warnings, 0 failed in 116.41s`
-
-基线为 236，通过数增加 38。警告均来自 lxml/BeautifulSoup 的 `strip_cdata` 依赖弃用提示。
-
-## 23. pip check、编译和 diff 检查结果
-
-- `pip check`：`No broken requirements found.`
-- `python -m py_compile`：修改的生产与测试 Python 文件全部退出码 0。
-- `python main.py --version`：`eMAG Crawler V2.2.1`。
-- 任务文件 `git diff --check` 和暂存区 `git diff --cached --check`：退出码 0。
-- 全工作区只保留老大自己的 `config/categories.txt` 修改，该文件未进入提交。
-
-## 24. JSON/CSV/XLSX 实际写盘数量
-
-独立于 pytest 临时目录，使用生产 Exporters 写入 `output/v221_actual_write_20260811/` 后重新读取：
-
-- products.json：2
-- products.csv：2
-- products.xlsx：2
-
-同时确认 CSV BOM、最高四级动态列、XLSX 价格/评分/评价数量数值类型和 JSON extra 对象类型。
-
-## 25. 修复前后字段数量对比
-
-- ProductItem 普通字段：仍为原有 34 项，没有新增模型字段。
-- 旁路信息只存在注册表和 PageResult 分析元数据，不写入 ProductItem 或 extra。
-- Boxe 原商品卡回退路径为三级；页面证据完善后只增加授权的 `四级类=Boxe`。
-- JSON 不增加空的五级类。
-- 实际写盘输入 2 条，三种输出均为 2 条。
-
-## 26. 非类目字段值一致性结果
-
-测试删除“一级类至五级类”后，对修复前回退输出和旁路增强输出进行完整字典深度比较，结果完全相等。
-
-已覆盖 PNK、product_id、offer_id、标题、URL、三个价格、折扣、库存、品牌、商品标签、链接打标、评分、评价数量、图片 URL、本地图片路径、时间、HTTP 状态、解析来源和完整 extra。内部 ProductItem 和 Exporters 英文字典在导出前后也完全相等。
-
-## 27. 真实 HTTP 验证结果
-
-- 北京时间：`2026-08-11T14:42:11+08:00`
+- 时间：2026-08-11 15:30（Asia/Shanghai）
 - URL：`https://www.emag.ro/boxe/c?ref=bc`
-- 条件：纯 HTTP、1 页、无图片、page/category/max-in-flight 均为 1。
-- HTTP 状态：`511`
-- 证据：`HTTP 511; captcha in body; WAF in body`
-- 程序版本：`2.2.1`
-- 状态：`waf_blocked`
-- 退出码：`3`
-- 商品：`0`
-- 完成类目：`0/1`
-- JSON/CSV/XLSX：`0/0/0`
-- 重试：否，首次 511 后立即停止。
-- 临时配置：已删除。
+- 条件：纯 HTTP、1 页、无图片、page/category/max-in-flight 均为 1、`retries=0`
+- 结果：HTTP 0；Scrapling 报错 `No active session available`
+- 状态：`network_error`
+- 逻辑退出码：2
+- 商品：0
+- JSON/CSV/XLSX：0/0/0
+- 临时配置：已删除且未提交
 
-**真实HTTP验证因WAF阻断暂未完成。**
+该错误发生在取得 eMAG 响应之前，因此不能判断线上页面为商品页、WAF 或其他 HTTP 页面，也不能在线核验 PNK `DR8D26BBM`。真实 HTTP 验证暂未完成。
 
-## 28. 已知限制
+## 31. 已知限制
 
-- HTTP 511 阻止了当前线上 Boxe HTML 调查，无法确认实时页面实际提供可见面包屑、JSON-LD 还是嵌入状态，也无法在线验证 PNK `DR8D26BBM`。
-- 明确嵌入状态只解析 JSON 或带受控初始化标记的脚本，不执行任意 JavaScript；无法解析的脚本会安全忽略。
-- 如果所有页面和卡片来源都无法通过末级一致性校验，本版本宁可不输出层级，也不会猜测。
-- CSV 按标准保存数值文本；JSON 和 XLSX 保持原生数值类型。
-- V2.2.1 仍是开发分支，待 ChatGPT 和老大最终验收后再决定稳定归档。
+- 当前环境的 Scrapling 会话错误阻止线上验证；需要在可正常建立 Scrapling HTTP 会话的环境中重新进行一次低频验证。
+- 无链接的显式 breadcrumb 叶子只作为临时候选；若后续页没有更强证据，最多检查 3 次后保留当前最佳结果。
+- 两条独立高可信路径冲突时宁可回退商品路径或不输出页面层级，不自动裁决。
+- V2.2.1 仍待 ChatGPT 与老大验收。
 
-## 29. 最终分支 SHA
+## 32. 分支最终 SHA
 
 功能提交推送后：
 
-- `V2.1.1`：`a94cc5c0a0dbb14011018e856c827f7b69eda088`
-- `V2.1.2`：`ff6963a64aa09b65ab489d0903f9cf1806964b88`
-- `V2.1.3`：`4306b1fb1176dde258f892cc803c52550fc241a8`
-- `V2.1.4`：`6f28db70231a1a66e3c931944b46061392b83a12`
-- `V2.2.0`：`5c444806b382b56c13c7afe5eaab31d94288afdc`
-- `main`：`383c1e8fdf38f75c257558ac42786faf2f567604`
-- `V2.2.1` 功能提交：`237b5338f7955f4d0bc5c777ebb303f7f0127789`
+- V2.1.1：`a94cc5c0a0dbb14011018e856c827f7b69eda088`
+- V2.1.2：`ff6963a64aa09b65ab489d0903f9cf1806964b88`
+- V2.1.3：`4306b1fb1176dde258f892cc803c52550fc241a8`
+- V2.1.4：`6f28db70231a1a66e3c931944b46061392b83a12`
+- V2.2.0：`5c444806b382b56c13c7afe5eaab31d94288afdc`（未变化）
+- main：`383c1e8fdf38f75c257558ac42786faf2f567604`（未变化）
+- V2.2.1 功能提交：`ee8667ce5e4ec82f9b1297b1fae5be12b27d725c`
 
-报告提交后会再次读取远程，确认除 main 文档提交和 V2.2.1 外，其他分支没有变化。
+报告提交后再次核对 V2.2.1 最终本地/远程 HEAD，并在最终回复给出。
 
-## 30. 需要 ChatGPT 重点复核的文件、函数和准确行号
+## 33. 需要 ChatGPT 重点复核的文件、函数和准确行号
 
-- `category_hierarchy.py:34`：类目名称一致性标准化。
-- `category_hierarchy.py:42`：类目 URL 规范化和分页复用键。
-- `category_hierarchy.py:100`：根节点、重复层级和当前末级校验。
-- `category_hierarchy.py:126`：不拼接的统一候选选择。
-- `category_hierarchy.py:141`：页面可见/JSON-LD/嵌入来源总入口。
-- `category_hierarchy.py:181`：页面旁路优先和原卡片路径回退。
-- `category_hierarchy.py:210`：线程安全注册表和较差证据保护。
-- `category_hierarchy.py:273`：可见面包屑提取。
-- `category_hierarchy.py:314`：JSON-LD BreadcrumbList 提取。
-- `category_hierarchy.py:363`：受控嵌入 JSON 提取。
-- `crawler.py:210`：HTTP 200 单 Soup 生产调用链。
-- `crawler.py:338`：按类目独立锁、双重检查和跨页复用。
-- `exporters.py:65`：旁路层级注册/读取。
-- `exporters.py:89`：三格式统一导出时注入旁路层级。
-- `output_schema.py:92`：统一页面证据/卡片回退选择。
-- `output_schema.py:153`：不修改内部字段的最终导出边界。
-- `tests/test_v221_category_hierarchy.py:67`：数据源测试。
-- `tests/test_v221_category_hierarchy.py:240`：并发和隔离测试。
-- `tests/test_v221_category_hierarchy.py:298`：性能及跨页复用测试。
-- `tests/test_v221_category_hierarchy.py:444`：动态 HTTP、实际写盘和数据不变。
-
-## 安全核验
-
-- 没有提交 config、用户备份、output、日志、图片、Cookie、Token、Authorization、真实响应、虚拟环境或缓存。
-- 没有使用浏览器、Playwright、Chromium、Selenium 或详情页请求。
-- 没有执行 hard reset、clean、强制推送或破坏用户文件的命令。
-- main 文档 worktree 在确认路径和干净状态后通过 `git worktree remove` 安全移除。
+- `category_hierarchy.py:29`：`CategoryPathEvidence`
+- `category_hierarchy.py:143`：`category_paths_are_consistent()`
+- `category_hierarchy.py:177`：`select_best_category_evidence()`
+- `category_hierarchy.py:207`：`extract_page_category_evidence()`
+- `category_hierarchy.py:281`：`select_product_category_levels()`
+- `category_hierarchy.py:369`：`CategoryLevelRegistry`
+- `category_hierarchy.py:470`：`_visible_breadcrumb_paths()`
+- `category_hierarchy.py:521`：`_json_ld_breadcrumb_paths()`
+- `crawler.py:340`：`_get_or_extract_category_evidence()`
+- `exporters.py:89`：`_to_output()`
+- `output_schema.py:156`：`product_to_output_dict()`
+- `tests/test_v221_category_accuracy_s1.py:71`：无关 breadcrumb 反例
+- `tests/test_v221_category_accuracy_s1.py:164`：冲突选择反例
+- `tests/test_v221_category_accuracy_s1.py:221`：页面/商品路径比较
+- `tests/test_v221_category_accuracy_s1.py:259`：真实 crawler 缓存升级与并发
+- `tests/test_v221_category_accuracy_s1.py:362`：三格式生产写盘
