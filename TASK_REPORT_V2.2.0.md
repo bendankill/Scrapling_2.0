@@ -1,309 +1,252 @@
-# Scrapling 2.0 V2.2.0 任务报告
+# Scrapling 2.0 V2.2.0 字段映射与数据完整性修复报告
 
 ## 1. 完成状态
 
-**自动化修复完成，真实HTTP验证因WAF阻断暂未完成。**
+**自动化修复完成，真实 HTTP 验证因 WAF 阻断暂未完成。**
 
-产品输出字段中文化、扩展信息明确字段中文化、一级至五级类目拆分、JSON/CSV/XLSX动态列和内部逻辑隔离均已实现，并通过连续两次完整自动化测试。唯一一次真实 eMAG 低频请求返回 HTTP 511，程序按要求立即停止，没有重试，因此不能声称真实商品抓取验证完成。
+本次只修复两个 S1 问题：`campaign_name` 输出名称错误，以及扩展信息字段翻译时的键冲突与静默覆盖。没有修改抓取、解析、去重、图片、详情页或商品字段值逻辑。
 
 ## 2. 当前分支
 
-`V2.2.0`
+`V2.2.0`，继续使用现有分支，没有创建新分支、Pull Request 或标签。
 
-该分支已设置跟踪 `origin/V2.2.0`。
+## 3. 修复前完整 SHA
 
-## 3. 创建分支时 V2.1.4 完整 SHA
+`aa65ab9a14308a6eb66e9dc3cbc450f850761e37`
 
-`6f28db70231a1a66e3c931944b46061392b83a12`
+任务开始时本地 HEAD 与 `origin/V2.2.0` 完全一致。
 
-创建前本地 `V2.1.4`、`origin/V2.1.4` 和 `git ls-remote` 完全一致。远程和本地均不存在来源不明的 `V2.2.0`，因此从该 SHA 新建分支并首次正常推送。
+## 4. 修复后完整 SHA
 
-## 4. V2.2.0 修复后完整 SHA
+代码、测试、README 首页版本记录和 CHANGELOG 修复提交：
 
-代码、测试和版本文档提交：
+`9e0ef2e5883f6482c08a7cfcf73f78f83556a272`
 
-`6de80e086b341c59d9a6c5cdecc237ab9f36df0c`
+提交信息：`fix: preserve V2.2.0 export mapping integrity`
 
-提交信息：`feat: add Chinese export fields and category hierarchy for V2.2.0`
-
-本报告在代码 SHA 产生后单独提交，以便准确记录代码修复 SHA。最终包含本报告的远程 HEAD SHA 以报告提交后的 `git rev-parse HEAD` 和 `git ls-remote` 核验为准。
+本报告在代码 SHA 产生后单独提交，最终包含报告的发布 HEAD 以任务结束时的本地、远程 SHA 核验结果为准。
 
 ## 5. 是否已推送
 
-是。代码提交已正常快进推送到 `origin/V2.2.0`，没有强制推送，没有创建 Pull Request，没有合并其他分支。
+是。代码提交已通过普通 `git push origin V2.2.0` 快进推送，没有强制推送。报告提交完成后将再次正常推送。
 
 ## 6. 本地与远程 SHA 是否一致
 
-代码提交推送后本地和远程均为：
+代码提交推送后，本地 HEAD 与 `origin/V2.2.0` 均为：
 
-`6de80e086b341c59d9a6c5cdecc237ab9f36df0c`
+`9e0ef2e5883f6482c08a7cfcf73f78f83556a272`
 
-任务报告提交后将再次核验最终 HEAD。
+报告提交后再次执行 `git rev-parse HEAD` 和 `git ls-remote origin refs/heads/V2.2.0` 进行最终核验。
 
-## 7. 修改文件清单
+## 7. config/categories.txt 是否未修改
 
-- `output_schema.py`：唯一产品字段映射、扩展信息映射、类目来源选择、五级拆分和动态列。
-- `exporters.py`：只在最终写文件边界转换 JSON/CSV/XLSX，内部商品字典继续使用英文。
-- `models.py`：旧列接口改为委托唯一输出模式，不再维护第二套字段翻译。
-- `tests/test_v220_chinese_exports.py`：V2.2.0 专项测试。
-- `tests/fixtures/v220_product_sample.json`：脱敏最小商品 fixture。
-- `tests/test_v214_codex_takeover.py`：将三处产品 JSON 旧英文键断言更新为 V2.2.0 中文键，断言强度未降低。
-- `crawler.py`：`run_summary.json` 版本号更新为 2.2.0；内部字段及统计结构不变。
-- `main.py`：CLI 显示版本更新为 V2.2.0。
-- `VERSION`：更新为 `2.2.0`。
-- `README.md`：更新 V2.2.0 标题与分支版本记录。
-- `CHANGELOG.md`：新增 V2.2.0 变更和验证范围。
+Codex 没有修改、恢复、暂存或提交 `config/categories.txt`。老大在任务开始前已有未提交配置，任务开始和修复完成时的文件哈希均为：
+
+`01f70b7d8a1f47e86ee3d0d070f5cce88ef93958`
+
+用户文件 `config/categories - 副本.txt1` 同样保持未跟踪状态，没有加入提交。真实 HTTP 验证使用 `output/` 下临时配置，验证后已删除。
+
+## 8. campaign_name 修复前后映射
+
+- 修复前：`campaign_name -> 活动名称`
+- 修复后：`campaign_name -> 链接打标`
+- `badges -> 商品标签` 保持独立，不合并、不覆盖。
+- 输入 `campaign_name="Top Favorite"` 时，JSON、CSV、XLSX 回读值均为 `链接打标="Top Favorite"`。
+- 三种格式均不再出现 `活动名称`。
+- 顶层产品映射仍为原有 34 项，没有增加未授权商品字段。
+
+## 9. 扩展信息键冲突根因
+
+旧实现把 `favorite_data` 内部字段和 `extra` 顶层字段放在同一张通用映射表中，并在 `translate_extra()` 中直接按翻译后的键写入普通字典。由此产生两个问题：
+
+1. 顶层意外出现的 `category_trail` 被错误套用 `favorite_data.category_trail` 的规则，与顶层 `data-category-trail` 同时变成 `类目路径`。
+2. 翻译目标键已被其他原键或现有中文键占用时，后写值直接覆盖先写值，字段数和数据值静默减少。
+
+修复前的只读复现确认：场景 A 丢失 `A/B`，场景 B 丢失 `RAW`，场景 C 丢失 `RawName`。
+
+## 10. 最终冲突处理规则
+
+映射被严格拆为两个数据层：
+
+### favorite_data 内部专用映射（9 项）
+
+`pnk`、`productid`、`offerid`、`has_family`、`is_family`、`product_name`、`currency`、`price`、`category_trail`。
+
+### extra 顶层专用映射（7 项）
+
+`favorite_data`、`availability_id`、`data-category-id`、`data-department-id`、`data-category-trail`、`data-category-name`、`data-referrer`。
+
+安全转换函数先计算全部目标键，再识别冲突组：
+
+- 无冲突时正常翻译。
+- 多个原键指向同一目标键时，冲突组全部保留原键名。
+- 翻译目标与输入中已有键重名时，相关原键全部保留。
+- 不使用 `_2`、`duplicate` 等自创后缀。
+- 保持输入顺序、字段值、值类型和同层字段数量。
+- 生成新字典，不修改传入对象。
+- 最终字段数不一致时显式抛出异常，禁止静默丢数据。
+
+## 11. 三个冲突案例修复前后结果
+
+### 场景 A
+
+输入：`{"category_trail":"A/B","data-category-trail":"C/D"}`
+
+- 修复前：`{"类目路径":"C/D"}`，2 个字段变 1 个。
+- 修复后：`{"category_trail":"A/B","类目路径":"C/D"}`，2 个字段仍为 2 个。
+
+### 场景 B
+
+输入：`favorite_data={"pnk":"RAW","PNK码":"EXISTING"}`
+
+- 修复前：`{"PNK码":"EXISTING"}`，`RAW` 被覆盖。
+- 修复后：`{"pnk":"RAW","PNK码":"EXISTING"}`，两个键和值均保留。
+
+### 场景 C
+
+输入：`{"data-category-name":"RawName","类目名称":"ExistingName"}`
+
+- 修复前：`{"类目名称":"ExistingName"}`，`RawName` 被覆盖。
+- 修复后：`{"data-category-name":"RawName","类目名称":"ExistingName"}`，两个键和值均保留。
+
+### 不同层级正常场景 D
+
+`extra.favorite_data.category_trail` 输出为 `扩展信息.收藏数据.类目路径`，顶层 `data-category-trail` 输出为 `扩展信息.类目路径`；两个字段位于不同字典层级，均正常翻译。
+
+## 12. 修改文件清单
+
+- `output_schema.py`：修正“链接打标”，拆分两层映射，新增通用无损冲突保护。
+- `tests/test_v220_chinese_exports.py`：新增 6 个回归用例，并强化三格式字段和值断言。
+- `README.md`：同步更新 GitHub 首页 V2.2.0 版本日志。
+- `CHANGELOG.md`：记录 2026-08-11 数据完整性修复和测试数量。
 - `TASK_REPORT_V2.2.0.md`：本报告。
 
-没有修改 parser、图片下载或抓取请求逻辑，没有增加详情页请求。
+没有修改 crawler、parser、exporters、models、图片下载或正式配置。
 
-## 8. 完整顶层字段映射表
+## 13. 新增测试名称和关键断言
 
-唯一映射表共 `34` 项：
+修复前 V2.2.0 专项为 26 个用例，本次新增 6 个，总计 32 个：
 
-| 内部字段 | 产品输出字段 |
-|---|---|
-| `category_name` | `类目名称` |
-| `category_url` | `类目链接` |
-| `source_page_url` | `来源页面链接` |
-| `page_number` | `页码` |
-| `position_in_page` | `页内位置` |
-| `product_id` | `产品ID` |
-| `pnk` | `PNK码` |
-| `sku` | `SKU` |
-| `offer_id` | `报价ID` |
-| `title` | `产品标题` |
-| `product_url` | `产品链接` |
-| `price_current` | `前端价格` |
-| `price_old` | `PRP原价` |
-| `price_promo` | `活动价格` |
-| `price_current_raw` | `前端价格原文` |
-| `price_old_raw` | `PRP原价原文` |
-| `price_promo_raw` | `活动价格原文` |
-| `discount_percent` | `前端折扣` |
-| `currency` | `货币` |
-| `availability` | `库存状态` |
-| `stock_text` | `库存原文` |
-| `seller` | `卖家` |
-| `brand` | `品牌` |
-| `badges` | `商品标签` |
-| `campaign_name` | `活动名称` |
-| `shipping_text` | `配送信息` |
-| `rating` | `评论分数` |
-| `review_count` | `评价数量` |
-| `main_image_url` | `产品图片` |
-| `main_image_local_path` | `本地图片路径` |
-| `collected_at` | `抓取时间` |
-| `http_status` | `HTTP状态码` |
-| `parse_source` | `解析来源` |
-| `extra` | `扩展信息` |
+1. `test_scenario_a_top_level_category_trails_do_not_collide`：两个路径值和 2 个字段全部保留。
+2. `test_scenario_b_existing_chinese_favorite_key_preserves_both_original_keys`：`RAW` 与 `EXISTING` 均保留。
+3. `test_scenario_c_existing_chinese_top_key_preserves_both_original_keys`：`RawName` 与 `ExistingName` 均保留。
+4. `test_scenario_d_same_label_in_different_layers_translates_normally`：两个层级分别正常翻译。
+5. `test_extra_translation_preserves_order_types_counts_and_input`：顺序、类型、字段数不变，输入深度比较不变。
+6. `test_three_formats_round_trip_campaign_and_collision_values`：三格式实际写入回读“Top Favorite”，旧标签不存在，扩展信息无丢键。
 
-英文键不会与对应中文键同时出现在产品输出中。
+现有映射、JSON、CSV、XLSX 用例同时增加：
 
-## 9. 扩展信息字段映射表
+- `campaign_name -> 链接打标` 精确断言。
+- `badges -> 商品标签` 独立值断言。
+- 三种格式 `活动名称` 不存在断言。
+- 专用映射严格为 9 项和 7 项。
+- 顶层意外 `pnk` 保持原名。
 
-明确映射共 `16` 项：
+没有删除测试、使用空断言或降低旧断言强度。
 
-| 内部键 | 输出键 |
-|---|---|
-| `favorite_data` | `收藏数据` |
-| `pnk` | `PNK码` |
-| `productid` | `产品ID` |
-| `offerid` | `报价ID` |
-| `has_family` | `是否存在系列商品` |
-| `is_family` | `是否为系列商品` |
-| `product_name` | `产品名称` |
-| `currency` | `货币` |
-| `price` | `价格` |
-| `category_trail` | `类目路径` |
-| `availability_id` | `库存状态ID` |
-| `data-category-id` | `类目ID` |
-| `data-department-id` | `部门ID` |
-| `data-category-trail` | `类目路径` |
-| `data-category-name` | `类目名称` |
-| `data-referrer` | `来源路径` |
+## 14. 专项测试结果
 
-所有值和数据类型保持原样；只生成新字典，不修改内部原始 extra。
+`tests/test_v220_chinese_exports.py`：
 
-## 10. 保持原名的未确认字段清单
+`32 passed in 2.20s`
 
-- `options_modal`
-- `scm_super_category`
-- `data-has-unfair-price`
-- 所有未列入 16 项明确映射表的其他技术字段
-- `scm_super_category` 内部的 `id`、`name`
+## 15. 两次完整测试结果
 
-专项测试验证上述字段的名称、嵌套结构和值均保持原样。
+- 第 1 次：`236 passed, 233 warnings, 0 failed in 127.20s`
+- 第 2 次：`236 passed, 228 warnings, 0 failed in 115.23s`
 
-## 11. 类目层级数据来源和优先级
+通过数由修复前 230 增至 236。警告均为 lxml/BeautifulSoup 的 `strip_cdata` 依赖弃用提示，不是测试失败。
 
-当前实现只使用商品对象已经抓到的真实 extra 证据，不访问详情页，也不从 `category_name` 猜完整路径：
+## 16. pip check、编译检查和 git diff --check
 
-1. `extra.favorite_data.category_trail`
-2. `extra["data-category-trail"]`
+- `pip check`：`No broken requirements found.`
+- `python -m py_compile output_schema.py tests/test_v220_chinese_exports.py`：退出码 0。
+- 额外 AST 语法解析：2 个修改的 Python 文件通过。
+- `git diff --check -- output_schema.py tests/test_v220_chinese_exports.py README.md CHANGELOG.md`：退出码 0。
+- 全工作区检查只显示老大已有 `config/categories.txt` 的末尾空行提示；该文件哈希未变，未进入提交。
 
-当两个来源同时存在时：
+## 17. JSON、CSV、XLSX 实际写盘记录数量
 
-- 先要求路径真实末级与当前商品 `category_name` 一致；
-- 在一致的候选中选择完整层级数更多的路径；
-- 层级数相同时选择 `favorite_data.category_trail`；
-- 从不拼接两个路径；
-- 所有来源都不一致时不输出任何层级字段。
+在被 Git 忽略的 `output/s1_actual_write/` 中创建两条 ProductItem，实际调用生产 `Exporters.finalize()`，随后分别重新读取三个文件：
 
-没有把页面 breadcrumb 新增到 ProductItem，因为当前 ProductItem 没有该字段，强行增加会违反本次“保持现有数据和字段范围”的要求。
+- products.json：2 条
+- products.csv：2 条
+- products.xlsx：2 条
 
-## 12. 一级至五级拆分规则
+额外实际确认：
 
-- 只按 `/` 拆分。
-- 每段去除前后空白。
-- 连续 `/` 产生的空段被忽略，不制造空层级。
-- 逗号、连字符、`&` 和罗马尼亚语特殊字符不作为分隔符。
-- 第 1—5 段依次输出 `一级类`、`二级类`、`三级类`、`四级类`、`五级类`。
-- 缺少路径时不使用 `category_name` 补造一级类。
+- CSV 以 UTF-8 BOM `EF BB BF` 开头。
+- XLSX 的价格、评分为浮点数，评价数量为整数。
+- 整批最高三级，CSV/XLSX 动态列包含到 `三级类`。
+- JSON 的 `扩展信息` 是对象。
+- CSV/XLSX 的 `扩展信息` 是可由 `json.loads` 完整还原的字符串。
 
-示例路径严格拆分为：
+## 18. 三种格式“链接打标”的实际值
 
-- `一级类`：`TV, Audio-Video & Foto`
-- `二级类`：`Audio HI-FI & Profesionale`
-- `三级类`：`Boxe`
+- JSON：`Top Favorite`
+- CSV：`Top Favorite`
+- XLSX：`Top Favorite`
 
-没有补充 `Audio Hi-Fi` 或任何参考数据中的中间层级。
+三者完全一致，且三个输出中均不存在 `活动名称`。
 
-## 13. 超过五级的处理规则
+## 19. 扩展信息转换前后的字段数量
 
-先读取完整路径并用真实最后一级校验当前商品类目，然后只输出前五段。第六级及后续段不生成新顶层字段，原始完整路径继续保存在翻译后的 `扩展信息.收藏数据.类目路径` 或 `扩展信息.类目路径` 中。
+实际写盘冲突样本：
 
-## 14. JSON 缺失层级处理方式
+- extra 顶层：转换前 5，转换后 5。
+- favorite_data 层：转换前 2，转换后 2。
+- 场景 A：转换前 2，转换后 2。
+- 场景 B：转换前 2，转换后 2。
+- 场景 C：转换前 2，转换后 2。
 
-每条商品只包含实际存在的层级键。三级商品不会出现空的 `四级类` 和 `五级类`；路径缺失或无法确认时，一级至五级都不输出。
+所有原值、值类型、嵌套结构和顺序均由专项测试或实际三格式回读确认。
 
-## 15. CSV/XLSX 动态列处理方式
+## 20. 真实 HTTP 验证结果
 
-- 先转换整批商品并计算实际出现的最高层级。
-- 最高三级时只加入一级至三级列。
-- 最高四级时加入一级至四级列。
-- 最高五级或原路径超过五级时加入一级至五级列。
-- 层级不足的商品在后续固定列中留空。
-- 没有商品或整批没有真实路径时不增加空的类目层级列。
-- JSON、CSV、XLSX 的普通字段顺序均来自同一份映射表。
+唯一一次请求：
 
-## 16. 字段值保持不变的验证结果
-
-专项 fixture 对 33 个非 extra 原字段逐项执行值相等和 Python 类型完全相等断言，并另外验证翻译后的 extra 值：
-
-- PNK、产品 ID、Offer ID、标题、URL、三个价格、折扣、货币、库存、卖家、品牌、标签、配送、评分、评价数量、图片 URL、图片路径、抓取时间、HTTP 状态和解析来源均不变。
-- `brand=""` 仍为空字符串，没有从标题中的 JRH 推断。
-- `price_current=529.97` 仍为浮点数 `529.97`。
-- `review_count=4` 仍为整数 `4`。
-- `price_promo=null` 在 JSON 中仍为 `null`，在 XLSX 中为空单元格。
-- 罗马尼亚语标题 `Boxă ...` 和 `în stoc` 保持 UTF-8 原文。
-- 布尔值 `false` 仍为布尔值。
-- 导出前后的内部英文商品列表深度比较完全相等。
-- 商品排序继续使用内部 `category_name/page_number/position_in_page`，验证顺序为 `A`、`Z`，没有因翻译改变。
-- run_summary、errors.csv、去重和图片路径回填仍使用内部英文键。
-
-## 17. 修复前后记录数量对比
-
-自动化三格式一致性用例输入 `2` 条 ProductItem：
-
-- 转换前内部记录：`2`
-- products.json：`2`
-- products.csv：`2`
-- products.xlsx：`2`
-
-记录数量没有因为字段映射增加或丢失。真实请求因 HTTP 511 在商品页返回前被阻断，因此真实记录为 `0`，不能用于证明真实商品值映射。
-
-## 18. JSON/CSV/XLSX 数量对比
-
-- 自动化真实写盘测试：`2/2/2`，一致。
-- WAF 真实请求输出：`0/0/0`，一致。
-
-WAF 空输出的 CSV 使用 UTF-8 BOM；原始开头字节为 `EF BB BF`，首字段 UTF-8 字节对应 `类目名称`。XLSX 首字段 Unicode 码点同样对应 `类目名称`。PowerShell 回显乱码是终端代码页问题，不是文件乱码。
-
-## 19. 新增测试名称和断言
-
-新增 `21` 个测试函数、共 `26` 个 pytest 测试用例（一级至六级路径使用 6 组参数化用例）：
-
-1. `test_complete_mapping_has_exact_34_fields`：完整 34 项映射和指定名称。
-2. `test_sample_values_and_types_are_unchanged`：逐字段值和类型不变、英文键消失。
-3. `test_output_order_inserts_real_levels_after_source`：字段顺序和类目插入位置。
-4. `test_extra_mapping_preserves_unknown_values_and_structure`：明确键翻译、未知结构不变。
-5. `test_extra_mapping_table_has_exact_confirmed_fields`：扩展映射严格 16 项。
-6. `test_confirmed_top_level_extra_key_is_also_translated`：顶层明确 extra 键转换。
-7. `test_product_item_legacy_column_api_uses_unique_schema`：旧列接口委托唯一模式。
-8. `test_three_levels_split_only_on_slash`：示例三级路径精确拆分，不按逗号拆分。
-9. `test_one_to_six_level_paths[1..6]`：一级至六级，六级只输出前五级。
-10. `test_whitespace_empty_segments_comma_and_romanian_characters`：空白、连续斜杠、逗号、特殊字符。
-11. `test_missing_path_never_uses_category_name_as_guess`：缺失路径不猜层级。
-12. `test_more_complete_consistent_source_wins_without_concatenation`：选择更完整一致来源，不拼接。
-13. `test_mismatched_favorite_source_falls_back_to_consistent_source`：不一致高优先级来源被拒绝。
-14. `test_equal_length_consistent_sources_use_favorite_priority`：同层级数按稳定来源优先。
-15. `test_all_mismatched_sources_produce_no_guessed_levels`：全部不一致时不猜测。
-16. `test_json_chinese_keys_dynamic_levels_and_whitelist`：中文键、类型、动态层级和禁止字段。
-17. `test_csv_utf8_bom_dynamic_columns_empty_cells_and_count`：BOM、动态列、空单元格、值和行数。
-18. `test_xlsx_chinese_dynamic_columns_numeric_and_empty_values`：中文表头、五级列、数值和空值类型。
-19. `test_three_format_counts_order_and_core_values_match`：三格式数量、顺序和核心值一致。
-20. `test_product_item_and_exporter_internal_fields_stay_english`：内部英文字段和图片路径回填不变。
-21. `test_run_summary_and_errors_schema_are_not_product_translated`：run_summary/errors.csv 不被产品映射影响。
-
-没有删除旧测试；三处旧 JSON 断言仅将 `title` 改为新规范的 `产品标题`，期望值和业务断言均未放宽。
-
-## 20. 完整测试连续两次结果
-
-测试环境：Python `3.12.13`，pytest 临时目录位于被 Git 忽略的 `output/`。
-
-- 专项测试：`26 passed in 0.80s`
-- 相关回归：`116 passed, 2 skipped, 0 failed in 100.98s`
-- 完整测试第 1 次：`230 passed, 228 warnings, 0 failed in 115.10s`
-- 完整测试第 2 次：`230 passed, 228 warnings, 0 failed in 115.39s`
-
-警告均为项目依赖 lxml/BeautifulSoup 的 `strip_cdata` 弃用提示。完整套件覆盖现有单元、集成、HTTP/WAF、分页、图片、导出和统计测试。
-
-## 21. pip check 结果
-
-`No broken requirements found.`
-
-Python 语法编译检查和 `git diff --check` 同样通过。
-
-## 22. 真实 eMAG 测试结果
-
-临时配置仅包含：
-
-`https://www.emag.ro/boxe/c?ref=bc`
-
-执行条件：纯 HTTP、1 页、无图片、类目/页面/总请求并发均为 1。正式 `config/categories.txt` 没有用于本次请求，也没有被测试脚本覆盖。
-
-- 请求开始：`2026-08-10T13:38:33.737751+00:00`（上海时间 21:38:33）
+- 北京时间：`2026-08-11T11:27:04+08:00`
+- URL：`https://www.emag.ro/boxe/c?ref=bc`
+- 条件：纯 HTTP、1 页、无图片，类目/页面/总请求并发均为 1。
 - HTTP 状态：`511`
-- WAF 证据：`HTTP 511; captcha in body; WAF in body`
+- 错误证据：`HTTP 511; captcha in body; WAF in body`
 - 程序状态：`waf_blocked`
 - 退出码：`3`
-- 请求页：`1`
-- 成功页：`0`
+- 商品：`0`
 - 完成类目：`0/1`
-- 抓取商品：`0`
 - JSON/CSV/XLSX：`0/0/0`
-- 是否重试：否；首次 511 后立即停止
-- 示例 PNK `DR8D26BBM`：页面被 WAF 阻断，无法检查是否仍在当前页
-- 临时配置：验证后已删除
+- 是否重试：否，首次 511 后立即停止。
+- 临时配置：已删除。
 
-## 23. 是否抓到大于 0 条真实商品
+**真实 HTTP 验证因 WAF 阻断暂未完成。** 不能用自动化 fixture 冒充线上商品验证。
 
-否。原因是唯一一次真实请求返回 HTTP 511 WAF，而不是解析或字段映射失败。按任务要求没有连续重试，因此真实验证状态必须保持“暂未完成”。
+## 21. 已知限制
 
-## 24. 是否修改 config/categories.txt
+- HTTP 511 阻止了本次线上商品回读，因此无法确认当前 Boxe 页面上 PNK `DR8D26BBM` 是否仍存在。
+- 冲突时按要求保留原字段名，因此单个冲突字典可能同时包含英文键和已有中文键；这是防止数据丢失的明确规则，不是重复翻译。
+- CSV 没有原生数值单元类型；数值按 CSV 文本规范输出，JSON 和 XLSX 保持原生数值。
+- 老大的 `config/categories.txt` 修改和未跟踪备份继续保留，所以最终 `git status --short` 会显示它们。
 
-Codex 本次没有修改、暂存或提交该文件。
+## 22. 需要 ChatGPT 重点复核的文件、函数和准确行号
 
-任务开始时该文件已有老大确认的测试配置修改，内容哈希为：
+- `output_schema.py:12`：`PRODUCT_OUTPUT_FIELD_MAP`，检查 `campaign_name -> 链接打标` 与 `badges -> 商品标签`。
+- `output_schema.py:49`：`FAVORITE_DATA_OUTPUT_FIELD_MAP` 9 项专用映射。
+- `output_schema.py:61`：`EXTRA_TOP_LEVEL_OUTPUT_FIELD_MAP` 7 项顶层映射。
+- `output_schema.py:116`：`translate_extra()` 分层转换，不修改输入。
+- `output_schema.py:133`：`_translate_mapping_without_loss()` 冲突组识别、原键回退和字段数断言。
+- `output_schema.py:168`：`product_to_output_dict()` 唯一产品导出边界。
+- `tests/test_v220_chinese_exports.py:104`：场景 A。
+- `tests/test_v220_chinese_exports.py:110`：场景 B。
+- `tests/test_v220_chinese_exports.py:118`：场景 C。
+- `tests/test_v220_chinese_exports.py:127`：正常分层场景 D。
+- `tests/test_v220_chinese_exports.py:137`：顺序、类型、数量和输入不变。
+- `tests/test_v220_chinese_exports.py:292`：JSON/CSV/XLSX 实际写入回读。
+- `README.md:9`：GitHub 首页 V2.2.0 版本日志。
+- `CHANGELOG.md:5`：本次数据完整性修复记录。
 
-`7732ac1747d3f708630105b8eb1cdb7513c2e74d`
+## 分支与安全核验
 
-创建分支前使用可恢复 stash 临时保存，创建后立即恢复；实现、测试、真实请求和提交后的哈希仍为同一值。该文件继续以未暂存状态保留在老大工作区，不进入 V2.2.0 提交。
-
-## 25. V2.1.4 及其他分支是否保持不变
-
-保持不变：
+代码推送后再次读取远程分支：
 
 - `V2.1.1`：`a94cc5c0a0dbb14011018e856c827f7b69eda088`
 - `V2.1.2`：`ff6963a64aa09b65ab489d0903f9cf1806964b88`
@@ -311,37 +254,4 @@ Codex 本次没有修改、暂存或提交该文件。
 - `V2.1.4`：`6f28db70231a1a66e3c931944b46061392b83a12`
 - `main`：`75500e45d244b61854de553eedbaad21e9d3005d`
 
-本任务的当前明确要求是其他分支 SHA 不变，因此只更新了 `V2.2.0` 分支中的 README/CHANGELOG 版本记录，没有改动默认分支 `main`。
-
-## 26. 已知限制
-
-- 真实 eMAG 验证被 HTTP 511 阻断，当前无法证明线上 `boxe` 商品的实际字段和值；不能把自动化 fixture 结果冒充真实验证。
-- 当前类目层级只使用 ProductItem 已有的两个 extra 路径来源。若真实页面只在 breadcrumb 提供路径而商品 extra 没有路径，本版本宁可不输出层级，也不会新增抓取字段或猜测。
-- 真实路径末级与 URL 生成的 `category_name` 无法一致确认时不输出层级，以避免错误类目。
-- CSV 本身没有原生数值类型；它按 CSV 标准输出数值文本，JSON 和 XLSX 保持原生数值类型。
-- `config/categories.txt` 保留老大的未提交测试配置，因此最终 `git status --short` 会如实显示该文件，但它不属于 V2.2.0 提交。
-
-## 27. 需要 ChatGPT 重点复核的文件、函数和行号
-
-- `output_schema.py:12`：`PRODUCT_OUTPUT_FIELD_MAP` 34 项唯一映射。
-- `output_schema.py:49`：`EXTRA_OUTPUT_FIELD_MAP` 16 项明确映射。
-- `output_schema.py:82`：`split_category_path()` 只按 `/` 拆分和五级截断。
-- `output_schema.py:94`：`extract_category_levels()` 完整度、末级一致性和来源优先级。
-- `output_schema.py:119`：`translate_extra()` 未确认技术结构保持。
-- `output_schema.py:137`：`product_to_output_dict()` 唯一导出边界转换和字段顺序。
-- `output_schema.py:160`：`output_columns()` CSV/XLSX 动态列。
-- `output_schema.py:177`：`max_category_level()` 批次最高层级。
-- `exporters.py:63`：CSV/XLSX 中文缓冲区。
-- `exporters.py:68`：JSON 中文缓冲区。
-- `exporters.py:78`：UTF-8 BOM CSV 写入。
-- `exporters.py:96`：XLSX 中文表头、动态列和数值类型。
-- `models.py:86`：旧列接口统一委托输出模式。
-- `tests/test_v220_chinese_exports.py:43` 至 `275`：21 个测试函数、26 个测试用例。
-- `tests/fixtures/v220_product_sample.json:1`：脱敏最小数据和类型基线。
-
-## 最终安全核验
-
-- 没有提交 output、真实请求响应、日志、图片、虚拟环境、缓存或临时配置。
-- 没有提交 Cookie、Authorization、Token、账号信息或真实用户凭据。
-- 没有执行 `git reset --hard`、`git checkout --`、`git clean -fd`、强制删除或强制推送。
-- 没有访问商品详情页，没有翻译商品内容，没有推断品牌，没有新增未经授权字段。
+以上分支均未变化。本任务没有提交 output、图片、日志、缓存、虚拟环境、临时配置、Cookie、Token、Authorization 或真实响应原文，也没有执行重置、清理、强制推送或详情页请求。
