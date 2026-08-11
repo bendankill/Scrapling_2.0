@@ -139,6 +139,7 @@ class TestS1UnrelatedBreadcrumbs:
             for index, name in enumerate(["eMAG", *FULL_LEVELS])
         ]
         items[0]["item"] = "https://www.emag.ro/"
+        items[-1]["item"] = "https://www.emag.ro/boxe/c"
         payload = {"@type": "BreadcrumbList", "itemListElement": items}
         html = f"<script type='application/ld+json'>{json.dumps(payload)}</script>"
         evidence = extract_page_category_evidence(
@@ -167,10 +168,10 @@ class TestS1EvidenceConflictRules:
         weak = _tentative_evidence(["Marketplace", "Recomandari", "Boxe"])
         assert select_best_category_evidence([strong, weak]) == strong
 
-    def test_long_consistent_tentative_extension_can_complete_strong_path(self):
+    def test_long_consistent_tentative_extension_cannot_replace_final_path(self):
         strong = _final_evidence(["TV", "Audio", "Boxe"])
         extension = _tentative_evidence(["TV", "Audio", "Audio Hi-Fi", "Boxe"])
-        assert select_best_category_evidence([strong, extension]) == extension
+        assert select_best_category_evidence([strong, extension]) == strong
 
     def test_two_equally_strong_conflicting_paths_are_ambiguous(self):
         first = _final_evidence(["TV", "Audio", "Boxe"])

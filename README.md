@@ -6,7 +6,7 @@
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
-| **V2.2.1（开发中）** | 2026-08-11 | 严格验证商品类目面包屑，拒绝账号/帮助导航；页面与商品路径统一比较，临时缓存可升级且禁止降级；304项测试通过 ([分支](https://github.com/bendankill/Scrapling_2.0/tree/V2.2.1)) |
+| **V2.2.1（开发中）** | 2026-08-11 | 类目链接执行同源与末级校验，拒绝纯文字帮助链、普通data-id和外域/c；缓存先比较可信度再比较长度；修正Scrapling重试验证，339项测试通过 ([分支](https://github.com/bendankill/Scrapling_2.0/tree/V2.2.1)) |
 | **V2.2.0** | 2026-08-11 | products三种格式统一中文字段与五级类目；修正“链接打标”，扩展信息采用分层映射和无损键冲突保护 ([分支](https://github.com/bendankill/Scrapling_2.0/tree/V2.2.0)) |
 | V2.1.4 | 2026-08-07 | HTTP 200页面准确分类、隐藏/script验证码防误判、card-fashion商品解析、逐卡错误与异常诊断 ([分支](https://github.com/bendankill/Scrapling_2.0/tree/V2.1.4)) |
 | V2.1.3 | 2026-08-05 | PNK图片命名、TXT运行配置、真实图片验证(Pillow)、跨批次缓存、类目数量日志 ([分支](https://github.com/bendankill/Scrapling_2.0/tree/V2.1.3)) |

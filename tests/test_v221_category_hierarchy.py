@@ -393,7 +393,8 @@ class TestCrawlerPerformanceAndReuse:
         crawler = EmagCrawler(str(tmp_path / "out"), download_images=False)
         boxe_soup = _soup(_listing_page(1, breadcrumb=True))
         casti_html = """<html><body><nav aria-label="Breadcrumb"><ol>
-          <li>eMAG</li><li>Electronice</li><li>Casti</li>
+          <li>eMAG</li><li><a href="/electronice/c">Electronice</a></li>
+          <li><a href="/casti/c">Casti</a></li>
         </ol></nav><h1>Casti</h1></body></html>"""
         casti_soup = _soup(casti_html)
         jobs = [

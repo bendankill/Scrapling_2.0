@@ -8,7 +8,7 @@ import unicodedata
 from dataclasses import dataclass, replace
 from threading import RLock
 from typing import Any, Iterable, Mapping, Sequence
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 
 ROOT_CATEGORY_NAMES = frozenset({"emag", "acasa", "home"})
@@ -45,8 +45,12 @@ class _PathDescriptor:
     levels: tuple[str, ...]
     source: str
     parent_links_verified: bool = False
+    all_nodes_verified: bool = False
     structured_breadcrumb: bool = False
     has_noncategory_parent_link: bool = False
+    has_noncategory_link: bool = False
+    leaf_link: str = ""
+    has_invalid_leaf_link: bool = False
 
 
 def normalize_category_name(value: Any) -> str:
@@ -157,10 +161,20 @@ def category_paths_are_consistent(
     return cursor == len(shorter)
 
 
-def _evidence_strength(evidence: CategoryPathEvidence) -> tuple[int, int, int, int]:
+def _evidence_tier(evidence: CategoryPathEvidence) -> int:
+    """Rank independent trust before path completeness or source score."""
+    if evidence.is_tentative:
+        return 1
+    if evidence.category_links_verified:
+        return 4
+    if evidence.structured_breadcrumb:
+        return 3
+    return 2
+
+
+def _evidence_strength(evidence: CategoryPathEvidence) -> tuple[int, int, int]:
     return (
-        int(not evidence.is_tentative),
-        int(evidence.category_links_verified or evidence.structured_breadcrumb),
+        _evidence_tier(evidence),
         evidence.reliability,
         int(evidence.current_category_explicit),
     )
@@ -169,6 +183,10 @@ def _evidence_strength(evidence: CategoryPathEvidence) -> tuple[int, int, int, i
 def _prefer_consistent(
     left: CategoryPathEvidence, right: CategoryPathEvidence,
 ) -> CategoryPathEvidence:
+    left_tier = _evidence_tier(left)
+    right_tier = _evidence_tier(right)
+    if left_tier != right_tier:
+        return left if left_tier > right_tier else right
     if len(left.levels) != len(right.levels):
         return left if len(left.levels) > len(right.levels) else right
     return left if _evidence_strength(left) >= _evidence_strength(right) else right
@@ -214,12 +232,12 @@ def extract_page_category_evidence(
         return None
 
     candidates: list[CategoryPathEvidence] = []
-    for descriptor in _visible_breadcrumb_paths(soup):
+    for descriptor in _visible_breadcrumb_paths(soup, page_url):
         evidence = _descriptor_to_evidence(descriptor, current_category)
         if evidence:
             candidates.append(evidence)
 
-    for descriptor in _json_ld_breadcrumb_paths(soup):
+    for descriptor in _json_ld_breadcrumb_paths(soup, page_url):
         evidence = _descriptor_to_evidence(descriptor, current_category)
         if evidence:
             candidates.append(evidence)
@@ -243,10 +261,21 @@ def _descriptor_to_evidence(
     descriptor: _PathDescriptor,
     current_category: str,
 ) -> CategoryPathEvidence | None:
-    if descriptor.has_noncategory_parent_link:
-        return None
     explicit = bool(validate_category_path(descriptor.levels, current_category))
-    allow_append = descriptor.parent_links_verified
+    if explicit:
+        if (descriptor.has_noncategory_parent_link or
+                descriptor.has_invalid_leaf_link):
+            return None
+        verified = descriptor.parent_links_verified
+    else:
+        if descriptor.has_noncategory_link:
+            return None
+        verified = descriptor.all_nodes_verified
+    if descriptor.source == "visible_breadcrumb" and not verified:
+        # Visible text alone can describe account/help navigation. It is not
+        # safe as a category-wide cache when no product path exists.
+        return None
+    allow_append = verified
     levels = validate_category_path(
         descriptor.levels,
         current_category,
@@ -255,7 +284,6 @@ def _descriptor_to_evidence(
     if not levels:
         return None
     appended = not explicit
-    verified = descriptor.parent_links_verified
     structured = descriptor.structured_breadcrumb
     final = verified
     if descriptor.source == "json_ld_breadcrumb":
@@ -352,6 +380,10 @@ def _select_page_and_product_evidence(
     if product is None:
         return page
     if category_paths_are_consistent(page.levels, product.levels):
+        # A product's own complete chain is not discarded by a shorter page
+        # chain, even when that page chain is independently verified.
+        if len(product.levels) > len(page.levels):
+            return product
         return _prefer_consistent(page, product)
     # A shorter page chain can never delete a fuller product chain.
     if len(page.levels) <= len(product.levels):
@@ -421,10 +453,43 @@ def _registry_replacement(
     return existing
 
 
-def _is_category_url(value: Any) -> bool:
-    parsed = urlparse(str(value or ""))
-    path = parsed.path.casefold().rstrip("/")
+def _origin_key(parsed: Any) -> tuple[str, str, int | None]:
+    scheme = str(parsed.scheme or "").casefold()
+    host = str(parsed.hostname or "").casefold()
+    if host in {"www.emag.ro", "emag.ro"}:
+        host = "emag.ro"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is None:
+        port = 443 if scheme == "https" else (80 if scheme == "http" else None)
+    return scheme, host, port
+
+
+def _is_category_url(value: Any, page_url: str) -> bool:
+    """Accept category URLs only when they resolve to the current page origin."""
+    raw = str(value or "").strip()
+    base = urlparse(str(page_url or ""))
+    if not raw or base.scheme.casefold() not in {"http", "https"} or not base.hostname:
+        return False
+    resolved = urlparse(urljoin(str(page_url), raw))
+    if resolved.scheme.casefold() not in {"http", "https"}:
+        return False
+    if _origin_key(resolved) != _origin_key(base):
+        return False
+    path = resolved.path.casefold().rstrip("/")
     return bool(re.search(r"/(?:p\d+/)?c$", path))
+
+
+def _leaf_category_url_matches(value: Any, page_url: str) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return True
+    if not _is_category_url(raw, page_url):
+        return False
+    return normalize_category_url(urljoin(str(page_url), raw)) == normalize_category_url(
+        page_url)
 
 
 def _node_category_href(node: Any) -> str:
@@ -436,7 +501,7 @@ def _has_category_id(node: Any) -> bool:
     for current in (node, node.find(True) if hasattr(node, "find") else None):
         if current is None:
             continue
-        for name in ("data-category-id", "data-id", "category-id"):
+        for name in ("data-category-id", "category-id"):
             if str(current.get(name) or "").strip():
                 return True
     return False
@@ -467,7 +532,9 @@ def _inside_ignored_breadcrumb_area(node: Any) -> bool:
     return False
 
 
-def _visible_breadcrumb_paths(soup: Any) -> list[_PathDescriptor]:
+def _visible_breadcrumb_paths(
+    soup: Any, page_url: str,
+) -> list[_PathDescriptor]:
     from utils import _is_visible_element
 
     paths: list[_PathDescriptor] = []
@@ -498,12 +565,22 @@ def _visible_breadcrumb_paths(soup: Any) -> list[_PathDescriptor]:
         aligned_links = links[root_count:root_count + len(levels)]
         aligned_ids = category_ids[root_count:root_count + len(levels)]
         parent_pairs = list(zip(aligned_links[:-1], aligned_ids[:-1]))
-        parent_verified = bool(parent_pairs) and all(
-            _is_category_url(href) or has_id for href, has_id in parent_pairs)
+        all_pairs = list(zip(aligned_links, aligned_ids))
+        leaf_link = aligned_links[-1] if aligned_links else ""
+        parent_verified = all(
+            _is_category_url(href, page_url) if href else has_id
+            for href, has_id in parent_pairs) and (
+                bool(parent_pairs) or bool(leaf_link))
+        all_nodes_verified = bool(all_pairs) and all(
+            _is_category_url(href, page_url) if href else has_id
+            for href, has_id in all_pairs)
         noncategory_parent = any(
-            bool(href) and not _is_category_url(href) and not has_id
+            bool(href) and not _is_category_url(href, page_url)
             for href, has_id in parent_pairs
         )
+        noncategory_link = any(
+            bool(href) and not _is_category_url(href, page_url)
+            for href, has_id in all_pairs)
         key = tuple(normalize_category_name(value) for value in levels)
         if key in seen:
             continue
@@ -511,14 +588,21 @@ def _visible_breadcrumb_paths(soup: Any) -> list[_PathDescriptor]:
         paths.append(_PathDescriptor(
             tuple(levels), "visible_breadcrumb",
             parent_links_verified=parent_verified,
+            all_nodes_verified=all_nodes_verified,
             structured_breadcrumb="breadcrumblist" in str(
                 container.get("itemtype") or "").casefold(),
             has_noncategory_parent_link=noncategory_parent,
+            has_noncategory_link=noncategory_link,
+            leaf_link=leaf_link,
+            has_invalid_leaf_link=not _leaf_category_url_matches(
+                leaf_link, page_url),
         ))
     return paths
 
 
-def _json_ld_breadcrumb_paths(soup: Any) -> list[_PathDescriptor]:
+def _json_ld_breadcrumb_paths(
+    soup: Any, page_url: str,
+) -> list[_PathDescriptor]:
     paths: list[_PathDescriptor] = []
     for script in soup.find_all("script"):
         if "ld+json" not in str(script.get("type") or "").casefold():
@@ -526,7 +610,7 @@ def _json_ld_breadcrumb_paths(soup: Any) -> list[_PathDescriptor]:
         payload = _parse_json_payload(script.string or script.get_text() or "")
         for breadcrumb in _find_breadcrumb_lists(payload):
             descriptor = _breadcrumb_items_to_descriptor(
-                breadcrumb.get("itemListElement") or [])
+                breadcrumb.get("itemListElement") or [], page_url)
             if descriptor:
                 paths.append(descriptor)
     return paths
@@ -545,7 +629,9 @@ def _find_breadcrumb_lists(value: Any) -> Iterable[Mapping[str, Any]]:
             yield from _find_breadcrumb_lists(nested)
 
 
-def _breadcrumb_items_to_descriptor(items: Any) -> _PathDescriptor | None:
+def _breadcrumb_items_to_descriptor(
+    items: Any, page_url: str,
+) -> _PathDescriptor | None:
     if not isinstance(items, list):
         return None
     positioned: list[tuple[int, str, str]] = []
@@ -576,13 +662,26 @@ def _breadcrumb_items_to_descriptor(items: Any) -> _PathDescriptor | None:
     root_count = max(0, len(names) - len(levels))
     urls = [url for _position, _name, url in positioned][root_count:]
     parents = urls[:-1]
-    parent_verified = bool(parents) and all(_is_category_url(url) for url in parents)
-    noncategory_parent = any(bool(url) and not _is_category_url(url) for url in parents)
+    leaf_link = urls[-1] if urls else ""
+    parent_verified = all(
+        _is_category_url(url, page_url) for url in parents) and (
+            bool(parents) or bool(leaf_link))
+    all_nodes_verified = bool(urls) and all(
+        _is_category_url(url, page_url) for url in urls)
+    noncategory_parent = any(
+        bool(url) and not _is_category_url(url, page_url) for url in parents)
+    noncategory_link = any(
+        bool(url) and not _is_category_url(url, page_url) for url in urls)
     return _PathDescriptor(
         tuple(levels), "json_ld_breadcrumb",
         parent_links_verified=parent_verified,
+        all_nodes_verified=all_nodes_verified,
         structured_breadcrumb=True,
         has_noncategory_parent_link=noncategory_parent,
+        has_noncategory_link=noncategory_link,
+        leaf_link=leaf_link,
+        has_invalid_leaf_link=not _leaf_category_url_matches(
+            leaf_link, page_url),
     )
 
 

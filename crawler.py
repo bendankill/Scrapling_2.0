@@ -75,6 +75,8 @@ class FetchResult:
     content_type: str = ""
     content_length: int = 0
     fetched_at: str = ""
+    error_type: str = ""
+    error_detail: str = ""
 
 
 class CategoryStats:
@@ -134,8 +136,17 @@ class EmagCrawler:
         os.makedirs(output_dir, exist_ok=True)
 
     # ---- Session ----
+    def _validated_session_retries(self) -> int:
+        value = self._session_config.get("retries")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(
+                "Scrapling FetcherSession retries must be an integer >= 1 "
+                f"(total request attempts); got {value!r}")
+        return value
+
     def _get_client(self):
         if not hasattr(self._thread_local, 'client'):
+            self._validated_session_retries()
             mgr = FetcherSession(**self._session_config)
             client = mgr.__enter__()
             self._thread_local.mgr = mgr; self._thread_local.client = client
@@ -195,9 +206,21 @@ class EmagCrawler:
                     fetched_at=fetched_at,
                 )
             except Exception as e:
-                logger.error(f"HTTP [{url}]: {e}")
+                retries = self._session_config.get("retries")
+                manager_entered = hasattr(self._thread_local, "mgr")
+                client_stored = hasattr(self._thread_local, "client")
+                detail = (
+                    f"{type(e).__name__}: {e}; retries={retries!r}; "
+                    f"manager_entered={manager_entered}; "
+                    f"client_stored={client_stored}; "
+                    f"thread_id={threading.get_ident()}; "
+                    "request_call_started=True"
+                )
+                logger.error(f"HTTP [{url}]: {detail}")
                 return FetchResult(request_url=url, final_url=url,
-                                   fetched_at=fetched_at)
+                                   fetched_at=fetched_at,
+                                   error_type=type(e).__name__,
+                                   error_detail=detail)
 
     # ---- 页面去重 ----
     def _cat_key(self, base_url): return base_url.lower().rstrip("/")
@@ -218,6 +241,9 @@ class EmagCrawler:
         pr.redirect_chain = fetched.redirect_chain
         pr.content_type = fetched.content_type
         pr.content_length = fetched.content_length
+        if fetched.error_type:
+            pr.fatal_error_type = fetched.error_type
+            pr.fatal_error_detail = fetched.error_detail
 
         # 403/429/511: 不解析DOM, 直接WAF
         if st in (403, 429, 511):
