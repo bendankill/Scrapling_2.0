@@ -14,17 +14,20 @@ from models import ProductItem
 from output_schema import (
     CATEGORY_LEVEL_FIELDS,
     EXTRA_OUTPUT_FIELD_MAP,
+    EXTRA_TOP_LEVEL_OUTPUT_FIELD_MAP,
+    FAVORITE_DATA_OUTPUT_FIELD_MAP,
     PRODUCT_OUTPUT_FIELD_MAP,
     extract_category_levels,
     output_columns,
     product_to_output_dict,
     split_category_path,
+    translate_extra,
 )
 
 
 FIXTURE_PATH = os.path.join(
     os.path.dirname(__file__), "fixtures", "v220_product_sample.json")
-FORBIDDEN_FIELDS = {"好评率", "星级值", "规格详情", "详情描述", "链接打标"}
+FORBIDDEN_FIELDS = {"好评率", "星级值", "规格详情", "详情描述"}
 
 
 @pytest.fixture
@@ -50,6 +53,8 @@ class TestOutputFieldMapping:
         assert PRODUCT_OUTPUT_FIELD_MAP["rating"] == "评论分数"
         assert PRODUCT_OUTPUT_FIELD_MAP["review_count"] == "评价数量"
         assert PRODUCT_OUTPUT_FIELD_MAP["main_image_url"] == "产品图片"
+        assert PRODUCT_OUTPUT_FIELD_MAP["campaign_name"] == "链接打标"
+        assert "活动名称" not in PRODUCT_OUTPUT_FIELD_MAP.values()
 
     def test_sample_values_and_types_are_unchanged(self, sample_dict):
         output = product_to_output_dict(sample_dict)
@@ -87,12 +92,67 @@ class TestOutputFieldMapping:
 
     def test_extra_mapping_table_has_exact_confirmed_fields(self):
         assert len(EXTRA_OUTPUT_FIELD_MAP) == 16
+        assert len(FAVORITE_DATA_OUTPUT_FIELD_MAP) == 9
+        assert len(EXTRA_TOP_LEVEL_OUTPUT_FIELD_MAP) == 7
         assert EXTRA_OUTPUT_FIELD_MAP["favorite_data"] == "收藏数据"
         assert EXTRA_OUTPUT_FIELD_MAP["data-referrer"] == "来源路径"
 
-    def test_confirmed_top_level_extra_key_is_also_translated(self):
+    def test_favorite_only_key_at_extra_top_level_stays_original(self):
         output = product_to_output_dict({"extra": {"pnk": "TOP", "options_modal": {"id": 1}}})
-        assert output["扩展信息"] == {"PNK码": "TOP", "options_modal": {"id": 1}}
+        assert output["扩展信息"] == {"pnk": "TOP", "options_modal": {"id": 1}}
+
+    def test_scenario_a_top_level_category_trails_do_not_collide(self):
+        extra = {"category_trail": "A/B", "data-category-trail": "C/D"}
+        translated = translate_extra(extra)
+        assert translated == {"category_trail": "A/B", "类目路径": "C/D"}
+        assert len(translated) == len(extra) == 2
+
+    def test_scenario_b_existing_chinese_favorite_key_preserves_both_original_keys(self):
+        extra = {"favorite_data": {"pnk": "RAW", "PNK码": "EXISTING"}}
+        translated = translate_extra(extra)
+        assert translated == {
+            "收藏数据": {"pnk": "RAW", "PNK码": "EXISTING"},
+        }
+        assert len(translated["收藏数据"]) == 2
+
+    def test_scenario_c_existing_chinese_top_key_preserves_both_original_keys(self):
+        extra = {"data-category-name": "RawName", "类目名称": "ExistingName"}
+        translated = translate_extra(extra)
+        assert translated == {
+            "data-category-name": "RawName",
+            "类目名称": "ExistingName",
+        }
+        assert len(translated) == 2
+
+    def test_scenario_d_same_label_in_different_layers_translates_normally(self):
+        extra = {
+            "favorite_data": {"category_trail": "A/B"},
+            "data-category-trail": "C/D",
+        }
+        assert translate_extra(extra) == {
+            "收藏数据": {"类目路径": "A/B"},
+            "类目路径": "C/D",
+        }
+
+    def test_extra_translation_preserves_order_types_counts_and_input(self):
+        extra = {
+            "availability_id": 7,
+            "unknown": [1, False, None, {"nested": "ă"}],
+            "favorite_data": {
+                "price": 529.97,
+                "options_modal": {"enabled": True},
+            },
+        }
+        before = copy.deepcopy(extra)
+        translated = translate_extra(extra)
+        assert list(translated) == ["库存状态ID", "unknown", "收藏数据"]
+        assert list(translated["收藏数据"]) == ["价格", "options_modal"]
+        assert len(translated) == len(extra)
+        assert len(translated["收藏数据"]) == len(extra["favorite_data"])
+        assert translated["unknown"] == extra["unknown"]
+        assert type(translated["库存状态ID"]) is int
+        assert type(translated["收藏数据"]["价格"]) is float
+        assert extra == before
 
     def test_product_item_legacy_column_api_uses_unique_schema(self):
         assert ProductItem.csv_columns(3) == output_columns(3)
@@ -173,6 +233,9 @@ class TestExportFormats:
         assert set(PRODUCT_OUTPUT_FIELD_MAP).isdisjoint(record)
         assert "三级类" in record and "四级类" not in record and "五级类" not in record
         assert record["产品标题"] == sample_dict["title"]
+        assert record["链接打标"] == sample_dict["campaign_name"]
+        assert record["商品标签"] == sample_dict["badges"]
+        assert "活动名称" not in record
         assert record["活动价格"] is None
         assert isinstance(record["前端价格"], float)
         assert isinstance(record["评价数量"], int)
@@ -198,6 +261,8 @@ class TestExportFormats:
         assert by_pnk["DR8D26BBM"]["前端价格"] == "529.97"
         assert "五级类" not in rows[0]
         assert "Boxă" in by_pnk["DR8D26BBM"]["产品标题"]
+        assert by_pnk["DR8D26BBM"]["链接打标"] == sample_dict["campaign_name"]
+        assert "活动名称" not in rows[0]
 
     def test_xlsx_chinese_dynamic_columns_numeric_and_empty_values(self, tmp_path, sample_dict):
         second = copy.deepcopy(sample_dict)
@@ -220,7 +285,46 @@ class TestExportFormats:
         assert sheet.cell(first_row, headers.index("活动价格") + 1).value is None
         assert isinstance(sheet.cell(first_row, headers.index("评论分数") + 1).value, float)
         assert isinstance(sheet.cell(first_row, headers.index("评价数量") + 1).value, int)
+        assert sheet.cell(first_row, headers.index("链接打标") + 1).value == sample_dict["campaign_name"]
+        assert "活动名称" not in headers
         workbook.close()
+
+    def test_three_formats_round_trip_campaign_and_collision_values(self, tmp_path, sample_dict):
+        sample = copy.deepcopy(sample_dict)
+        sample["campaign_name"] = "Top Favorite"
+        sample["extra"] = {
+            "category_trail": "A/B",
+            "data-category-trail": "C/D",
+            "favorite_data": {"pnk": "RAW", "PNK码": "EXISTING"},
+            "data-category-name": "RawName",
+            "类目名称": "ExistingName",
+        }
+        exporters = Exporters(str(tmp_path))
+        exporters.add_product(ProductItem(**sample))
+        exporters.finalize()
+
+        with open(tmp_path / "products.json", encoding="utf-8") as handle:
+            json_row = json.load(handle)[0]
+        with open(tmp_path / "products.csv", encoding="utf-8-sig", newline="") as handle:
+            csv_row = next(csv.DictReader(handle))
+        workbook = load_workbook(tmp_path / "products.xlsx", data_only=True)
+        sheet = workbook.active
+        headers = [cell.value for cell in sheet[1]]
+        xlsx_row = {header: sheet.cell(2, index + 1).value for index, header in enumerate(headers)}
+        workbook.close()
+
+        assert json_row["链接打标"] == csv_row["链接打标"] == xlsx_row["链接打标"] == "Top Favorite"
+        assert "活动名称" not in json_row and "活动名称" not in csv_row and "活动名称" not in xlsx_row
+        expected_extra = {
+            "category_trail": "A/B",
+            "类目路径": "C/D",
+            "收藏数据": {"pnk": "RAW", "PNK码": "EXISTING"},
+            "data-category-name": "RawName",
+            "类目名称": "ExistingName",
+        }
+        assert json_row["扩展信息"] == expected_extra
+        assert json.loads(csv_row["扩展信息"]) == expected_extra
+        assert json.loads(xlsx_row["扩展信息"]) == expected_extra
 
     def test_three_format_counts_order_and_core_values_match(self, tmp_path, sample_dict):
         exporters = Exporters(str(tmp_path))

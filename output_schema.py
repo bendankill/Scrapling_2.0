@@ -34,7 +34,7 @@ PRODUCT_OUTPUT_FIELD_MAP = OrderedDict([
     ("seller", "卖家"),
     ("brand", "品牌"),
     ("badges", "商品标签"),
-    ("campaign_name", "活动名称"),
+    ("campaign_name", "链接打标"),
     ("shipping_text", "配送信息"),
     ("rating", "评论分数"),
     ("review_count", "评价数量"),
@@ -46,8 +46,7 @@ PRODUCT_OUTPUT_FIELD_MAP = OrderedDict([
     ("extra", "扩展信息"),
 ])
 
-EXTRA_OUTPUT_FIELD_MAP = {
-    "favorite_data": "收藏数据",
+FAVORITE_DATA_OUTPUT_FIELD_MAP = {
     "pnk": "PNK码",
     "productid": "产品ID",
     "offerid": "报价ID",
@@ -57,6 +56,10 @@ EXTRA_OUTPUT_FIELD_MAP = {
     "currency": "货币",
     "price": "价格",
     "category_trail": "类目路径",
+}
+
+EXTRA_TOP_LEVEL_OUTPUT_FIELD_MAP = {
+    "favorite_data": "收藏数据",
     "availability_id": "库存状态ID",
     "data-category-id": "类目ID",
     "data-department-id": "部门ID",
@@ -65,19 +68,13 @@ EXTRA_OUTPUT_FIELD_MAP = {
     "data-referrer": "来源路径",
 }
 
-CATEGORY_LEVEL_FIELDS = ("一级类", "二级类", "三级类", "四级类", "五级类")
-
-# 只翻译 favorite_data 中这些已确认字段；未知技术结构保持原样。
-_FAVORITE_DATA_FIELD_MAP = {
-    key: value for key, value in EXTRA_OUTPUT_FIELD_MAP.items()
-    if key not in {
-        "favorite_data", "availability_id", "data-category-id",
-        "data-department-id", "data-category-trail", "data-category-name",
-        "data-referrer",
-    }
+# 保留公开的完整映射视图，实际转换严格按上面两个数据层级分别执行。
+EXTRA_OUTPUT_FIELD_MAP = {
+    **FAVORITE_DATA_OUTPUT_FIELD_MAP,
+    **EXTRA_TOP_LEVEL_OUTPUT_FIELD_MAP,
 }
-_EXTRA_TOP_LEVEL_FIELD_MAP = dict(EXTRA_OUTPUT_FIELD_MAP)
 
+CATEGORY_LEVEL_FIELDS = ("一级类", "二级类", "三级类", "四级类", "五级类")
 
 def split_category_path(path: Any) -> list[str]:
     """只按 / 拆分真实路径，去除空白和空段，最多返回五级。"""
@@ -117,20 +114,54 @@ def extract_category_levels(extra: Any, category_name: str = "") -> list[str]:
 
 
 def translate_extra(extra: Any) -> Any:
-    """翻译 extra 中明确字段名，不改变任何值、类型或未知技术结构。"""
+    """分层翻译 extra 的已确认字段，并在键冲突时完整保留原始键。"""
     if not isinstance(extra, Mapping):
         return extra
 
-    translated: dict[str, Any] = {}
+    prepared: dict[str, Any] = {}
     for key, value in extra.items():
-        output_key = _EXTRA_TOP_LEVEL_FIELD_MAP.get(key, key)
         if key == "favorite_data" and isinstance(value, Mapping):
-            translated[output_key] = {
-                _FAVORITE_DATA_FIELD_MAP.get(fav_key, fav_key): fav_value
-                for fav_key, fav_value in value.items()
-            }
+            prepared[key] = _translate_mapping_without_loss(
+                value,
+                FAVORITE_DATA_OUTPUT_FIELD_MAP,
+            )
         else:
-            translated[output_key] = value
+            prepared[key] = value
+    return _translate_mapping_without_loss(prepared, EXTRA_TOP_LEVEL_OUTPUT_FIELD_MAP)
+
+
+def _translate_mapping_without_loss(
+    source: Mapping[str, Any],
+    field_map: Mapping[str, str],
+) -> dict[str, Any]:
+    """安全翻译同一层字典；任何目标键冲突组都整体保留原始键名。"""
+    items = list(source.items())
+    proposed_targets = {
+        key: field_map.get(key, key)
+        for key, _value in items
+    }
+    target_groups: dict[str, list[str]] = {}
+    for key, target in proposed_targets.items():
+        target_groups.setdefault(target, []).append(key)
+
+    conflicting_keys = {
+        key
+        for keys in target_groups.values()
+        if len(keys) > 1
+        for key in keys
+    }
+    for key, target in proposed_targets.items():
+        if target != key and target in source:
+            conflicting_keys.add(key)
+            conflicting_keys.add(target)
+
+    translated: dict[str, Any] = {}
+    for key, value in items:
+        output_key = key if key in conflicting_keys else proposed_targets[key]
+        translated[output_key] = value
+
+    if len(translated) != len(items):
+        raise ValueError("字段名转换发生未处理的键冲突")
     return translated
 
 

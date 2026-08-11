@@ -6,7 +6,7 @@
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
-| **V2.2.0** | 2026-08-10 | products三种格式统一中文字段、扩展信息明确键中文化、真实类目路径拆分一级至五级、动态CSV/XLSX类目列 ([分支](https://github.com/bendankill/Scrapling_2.0/tree/V2.2.0)) |
+| **V2.2.0** | 2026-08-11 | products三种格式统一中文字段与五级类目；修正“链接打标”，扩展信息采用分层映射和无损键冲突保护 ([分支](https://github.com/bendankill/Scrapling_2.0/tree/V2.2.0)) |
 | V2.1.4 | 2026-08-07 | HTTP 200页面准确分类、隐藏/script验证码防误判、card-fashion商品解析、逐卡错误与异常诊断 ([分支](https://github.com/bendankill/Scrapling_2.0/tree/V2.1.4)) |
 | V2.1.3 | 2026-08-05 | PNK图片命名、TXT运行配置、真实图片验证(Pillow)、跨批次缓存、类目数量日志 ([分支](https://github.com/bendankill/Scrapling_2.0/tree/V2.1.3)) |
 | V2.1.2 | 2026-08-04 | 删除断点续抓、任务总耗时打印、有界图片Future+wait(FIRST_COMPLETED)调度+60s进度日志 |
