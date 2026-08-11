@@ -6,6 +6,7 @@ import logging
 import os
 from threading import Lock
 
+from category_hierarchy import CategoryLevelRegistry, CategoryPathEvidence
 from models import ProductItem
 from output_schema import (
     max_category_level,
@@ -29,6 +30,7 @@ class Exporters:
         # 所有商品数据 (list of dict)
         self._products: list[dict] = []
         self._lock = Lock()
+        self._category_levels = CategoryLevelRegistry()
 
     def add_product(self, product: ProductItem) -> None:
         """添加一个商品 (线程安全)"""
@@ -60,14 +62,39 @@ class Exporters:
         with self._lock:
             return len(self._products)
 
+    def register_category_levels(
+        self,
+        category_url: str,
+        evidence: CategoryPathEvidence,
+    ) -> bool:
+        """线程安全注册页面级旁路类目证据。"""
+        return self._category_levels.register(category_url, evidence)
+
+    def get_category_level_evidence(
+        self,
+        category_url: str,
+    ) -> CategoryPathEvidence | None:
+        """按规范化类目 URL 返回旁路证据副本。"""
+        return self._category_levels.get(category_url)
+
     def get_csv_buffer(self) -> list[dict]:
         """获取用于 CSV/XLSX 导出的中文数据 (扩展信息转为 JSON 字符串)"""
         sorted_prods = self.get_products_sorted()
-        return [product_to_output_dict(product, stringify_extra=True) for product in sorted_prods]
+        return [self._to_output(product, stringify_extra=True) for product in sorted_prods]
 
     def get_json_buffer(self) -> list[dict]:
         """获取 products.json 使用的中文数据，扩展信息保持 object。"""
-        return [product_to_output_dict(product) for product in self.get_products_sorted()]
+        return [self._to_output(product) for product in self.get_products_sorted()]
+
+    def _to_output(self, product: dict, *, stringify_extra: bool = False) -> dict:
+        evidence = self.get_category_level_evidence(
+            str(product.get("category_url") or ""))
+        levels = evidence.levels if evidence else None
+        return product_to_output_dict(
+            product,
+            stringify_extra=stringify_extra,
+            category_levels=levels,
+        )
 
     def write_json(self) -> None:
         """写入标准 products.json (JSON 数组, 原子写入)"""

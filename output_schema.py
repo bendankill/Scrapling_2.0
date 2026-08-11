@@ -1,12 +1,15 @@
-"""V2.2.0 产品导出模式：统一中文字段与真实类目层级。"""
+"""V2.2.1 产品导出模式：统一中文字段与旁路真实类目层级。"""
 
 from __future__ import annotations
 
 import json
-import re
-import unicodedata
 from collections import OrderedDict
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
+
+from category_hierarchy import (
+    select_product_category_levels,
+    split_category_path_all,
+)
 
 
 PRODUCT_OUTPUT_FIELD_MAP = OrderedDict([
@@ -78,39 +81,21 @@ CATEGORY_LEVEL_FIELDS = ("一级类", "二级类", "三级类", "四级类", "�
 
 def split_category_path(path: Any) -> list[str]:
     """只按 / 拆分真实路径，去除空白和空段，最多返回五级。"""
-    return _split_category_path_all(path)[:5]
+    return split_category_path_all(path)[:5]
 
 
 def _split_category_path_all(path: Any) -> list[str]:
     """解析完整真实路径，供末级一致性校验和完整度比较。"""
-    if not isinstance(path, str) or not path.strip():
-        return []
-    return [segment.strip() for segment in path.split("/") if segment.strip()]
+    return split_category_path_all(path)
 
 
-def extract_category_levels(extra: Any, category_name: str = "") -> list[str]:
-    """从商品已有 extra 证据选择最完整且与当前类目一致的路径。"""
-    if not isinstance(extra, Mapping):
-        return []
-
-    favorite = extra.get("favorite_data")
-    sources = []
-    if isinstance(favorite, Mapping):
-        sources.append((0, favorite.get("category_trail")))
-    sources.append((1, extra.get("data-category-trail")))
-
-    candidates: list[tuple[int, int, list[str]]] = []
-    for priority, raw_path in sources:
-        levels = _split_category_path_all(raw_path)
-        if not levels:
-            continue
-        if category_name and not _category_names_match(levels[-1], category_name):
-            continue
-        candidates.append((len(levels), -priority, levels[:5]))
-
-    if not candidates:
-        return []
-    return max(candidates, key=lambda candidate: (candidate[0], candidate[1]))[2]
+def extract_category_levels(
+    extra: Any,
+    category_name: str = "",
+    verified_levels: Sequence[str] | None = None,
+) -> list[str]:
+    """页面旁路证据优先；缺失时回退商品已有 extra 路径。"""
+    return select_product_category_levels(extra, category_name, verified_levels)
 
 
 def translate_extra(extra: Any) -> Any:
@@ -165,9 +150,18 @@ def _translate_mapping_without_loss(
     return translated
 
 
-def product_to_output_dict(product: Mapping[str, Any], *, stringify_extra: bool = False) -> dict:
+def product_to_output_dict(
+    product: Mapping[str, Any],
+    *,
+    stringify_extra: bool = False,
+    category_levels: Sequence[str] | None = None,
+) -> dict:
     """在最终导出边界将一个英文内部商品字典转换为中文输出字典。"""
-    levels = extract_category_levels(product.get("extra"), str(product.get("category_name") or ""))
+    levels = extract_category_levels(
+        product.get("extra"),
+        str(product.get("category_name") or ""),
+        category_levels,
+    )
     output: dict[str, Any] = {}
 
     for internal_name, output_name in PRODUCT_OUTPUT_FIELD_MAP.items():
@@ -213,13 +207,3 @@ def max_category_level(records: list[Mapping[str, Any]]) -> int:
             if field in record:
                 highest = max(highest, index)
     return highest
-
-
-def _category_names_match(path_final: str, category_name: str) -> bool:
-    return _normalize_category_name(path_final) == _normalize_category_name(category_name)
-
-
-def _normalize_category_name(value: str) -> str:
-    normalized = unicodedata.normalize("NFKD", str(value))
-    without_marks = "".join(char for char in normalized if not unicodedata.combining(char))
-    return re.sub(r"[^0-9a-z]+", "", without_marks.casefold())

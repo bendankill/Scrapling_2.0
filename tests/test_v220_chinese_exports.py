@@ -372,7 +372,7 @@ class TestInternalBoundaryRegression:
             str(output), download_images=False, page_workers=1,
             category_workers=1, max_in_flight=2)
         summary = crawler.finalize()
-        assert summary["version"] == "2.2.0"
+        assert summary["version"] == "2.2.1"
         assert {"version", "status", "categories", "totals"} <= set(summary)
         assert "版本" not in summary and "状态" not in summary
         with open(output / "errors.csv", encoding="utf-8-sig", newline="") as handle:

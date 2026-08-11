@@ -8,6 +8,11 @@ from datetime import datetime, timezone
 from threading import Lock, Semaphore, Event
 from typing import Optional
 from scrapling.fetchers import FetcherSession
+from category_hierarchy import (
+    CategoryPathEvidence,
+    extract_page_category_evidence,
+    normalize_category_url,
+)
 from models import ProductItem
 from parser import _parse_product_card, select_product_cards
 from image_downloader import ImageDownloader
@@ -54,6 +59,10 @@ class PageResult:
     waf_evidence: str = ""
     terminal_reason: str = ""
     diagnostic_paths: list = field(default_factory=list)
+    category_levels: list = field(default_factory=list)
+    category_level_source: str = ""
+    category_level_reliability: int = 0
+    category_levels_from_cache: bool = False
 
 
 @dataclass
@@ -118,6 +127,8 @@ class EmagCrawler:
         # 运行内唯一商品键集合 (替代已删除的 checkpoint)
         self._product_keys: set = set()
         self._keys_lock = Lock()
+        self._category_level_locks: dict[str, Lock] = {}
+        self._category_level_locks_guard = Lock()
         os.makedirs(output_dir, exist_ok=True)
 
     # ---- Session ----
@@ -255,6 +266,13 @@ class EmagCrawler:
             return pr
 
         if products:
+            evidence, from_cache = self._get_or_extract_category_evidence(
+                soup, name, base_url)
+            if evidence:
+                pr.category_levels = list(evidence.levels)
+                pr.category_level_source = evidence.source
+                pr.category_level_reliability = evidence.reliability
+                pr.category_levels_from_cache = from_cache
             return pr
 
         if parse_errors:
@@ -316,6 +334,33 @@ class EmagCrawler:
                     "url": card.get("data-url", "") or page_url,
                     "error_type": type(e).__name__, "error_detail": str(e)[:500]})
         return products, errors
+
+    def _get_or_extract_category_evidence(
+        self,
+        soup,
+        category_name: str,
+        category_url: str,
+    ) -> tuple[Optional[CategoryPathEvidence], bool]:
+        """同一类目只提取一次页面层级；不同类目使用独立锁和缓存键。"""
+        cached = self.exporters.get_category_level_evidence(category_url)
+        if cached:
+            return cached, True
+
+        cache_key = normalize_category_url(category_url)
+        with self._category_level_locks_guard:
+            category_lock = self._category_level_locks.setdefault(
+                cache_key, Lock())
+        with category_lock:
+            cached = self.exporters.get_category_level_evidence(category_url)
+            if cached:
+                return cached, True
+            evidence = extract_page_category_evidence(
+                soup, category_name, category_url)
+            if evidence:
+                self.exporters.register_category_levels(category_url, evidence)
+                return (self.exporters.get_category_level_evidence(category_url)
+                        or evidence), False
+        return None, False
 
     def _save_unknown_http200_diagnostic(self, name, pr: PageResult,
                                          html: str) -> list[str]:
@@ -644,7 +689,7 @@ class EmagCrawler:
                 "no_next_page", "empty_category", "category_unavailable")
             cat_dicts.append(d)
         summary = {
-            "version": "2.2.0", "status": status.value,
+            "version": "2.2.1", "status": status.value,
             "start_time": datetime.fromtimestamp(self.start_time, tz=timezone.utc).isoformat(),
             "end_time": datetime.now(timezone.utc).isoformat(),
             "elapsed_seconds": round(total_elapsed, 2),

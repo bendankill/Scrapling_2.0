@@ -1,4 +1,4 @@
-# eMAG 商品列表爬虫 V2.2.0
+# eMAG 商品列表爬虫 V2.2.1（开发中）
 
 基于 [Scrapling](https://github.com/D4Vinci/Scrapling) 纯 HTTP Fetcher 的 eMAG（罗马尼亚电商）商品列表页爬虫。
 
@@ -6,6 +6,7 @@
 
 | 版本 | 日期 | 说明 |
 |------|------|------|
+| **V2.2.1（开发中）** | 2026-08-11 | 从列表页可见面包屑、JSON-LD或嵌入状态提取完整类目路径；线程安全旁路缓存、跨页复用和五级动态导出 ([分支](https://github.com/bendankill/Scrapling_2.0/tree/V2.2.1)) |
 | **V2.2.0** | 2026-08-11 | products三种格式统一中文字段与五级类目；修正“链接打标”，扩展信息采用分层映射和无损键冲突保护 ([分支](https://github.com/bendankill/Scrapling_2.0/tree/V2.2.0)) |
 | V2.1.4 | 2026-08-07 | HTTP 200页面准确分类、隐藏/script验证码防误判、card-fashion商品解析、逐卡错误与异常诊断 ([分支](https://github.com/bendankill/Scrapling_2.0/tree/V2.1.4)) |
 | V2.1.3 | 2026-08-05 | PNK图片命名、TXT运行配置、真实图片验证(Pillow)、跨批次缓存、类目数量日志 ([分支](https://github.com/bendankill/Scrapling_2.0/tree/V2.1.3)) |
@@ -17,7 +18,7 @@
 | V2.0.1 | 2026-08-03 | 纯 HTTP 改造（删除浏览器）、TXT 类目配置、JSON 标准输出、WAF 退出码 |
 | V2.0.0 | 2026-08-03 | 初始 MVP 版本 |
 
-> 最新开发版本为 **V2.2.0**（`V2.2.0` 分支）。`main` 分支当前为 V2.1.0 稳定版。运行 `python main.py --version` 可确认本地版本，完整变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+> 当前已验收稳定版本为 **V2.2.0**。本分支 **V2.2.1** 用于类目层级完善开发，在ChatGPT最终核验和老大确认前不视为稳定版。运行 `python main.py --version` 可确认本地版本，完整变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 重要：纯 HTTP 模式
 
