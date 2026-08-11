@@ -129,6 +129,8 @@ class EmagCrawler:
         self._keys_lock = Lock()
         self._category_level_locks: dict[str, Lock] = {}
         self._category_level_locks_guard = Lock()
+        self._category_level_upgrade_checks: dict[str, int] = {}
+        self._category_level_max_upgrade_checks = 3
         os.makedirs(output_dir, exist_ok=True)
 
     # ---- Session ----
@@ -343,7 +345,7 @@ class EmagCrawler:
     ) -> tuple[Optional[CategoryPathEvidence], bool]:
         """同一类目只提取一次页面层级；不同类目使用独立锁和缓存键。"""
         cached = self.exporters.get_category_level_evidence(category_url)
-        if cached:
+        if cached and not cached.is_tentative:
             return cached, True
 
         cache_key = normalize_category_url(category_url)
@@ -352,14 +354,20 @@ class EmagCrawler:
                 cache_key, Lock())
         with category_lock:
             cached = self.exporters.get_category_level_evidence(category_url)
-            if cached:
+            if cached and not cached.is_tentative:
                 return cached, True
+            checks = self._category_level_upgrade_checks.get(cache_key, 0)
+            if cached and checks >= self._category_level_max_upgrade_checks:
+                return cached, True
+            self._category_level_upgrade_checks[cache_key] = checks + 1
             evidence = extract_page_category_evidence(
                 soup, category_name, category_url)
             if evidence:
                 self.exporters.register_category_levels(category_url, evidence)
                 return (self.exporters.get_category_level_evidence(category_url)
                         or evidence), False
+            if cached:
+                return cached, False
         return None, False
 
     def _save_unknown_http200_diagnostic(self, name, pr: PageResult,

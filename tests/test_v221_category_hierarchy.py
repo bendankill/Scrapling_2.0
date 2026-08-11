@@ -57,8 +57,9 @@ def _listing_page(card_count=1, breadcrumb=True):
     crumb = ""
     if breadcrumb:
         crumb = """<nav aria-label="Breadcrumb"><ol class="breadcrumb">
-          <li>eMAG</li><li>TV, Audio-Video &amp; Foto</li>
-          <li>Audio HI-FI &amp; Profesionale</li><li>Audio Hi-Fi</li><li>Boxe</li>
+          <li>eMAG</li><li><a href="/tv-audio-video-foto/c">TV, Audio-Video &amp; Foto</a></li>
+          <li><a href="/audio-hi-fi-profesionale/c">Audio HI-FI &amp; Profesionale</a></li>
+          <li><a href="/audio-hi-fi/c">Audio Hi-Fi</a></li><li>Boxe</li>
         </ol></nav>"""
     cards = "".join(_product_card(index) for index in range(1, card_count + 1))
     return f"<html><head><title>Boxe</title></head><body>{crumb}<h1>Boxe</h1>{cards}</body></html>"
@@ -69,8 +70,10 @@ class TestPageEvidenceSources:
         soup = _soup(BOXE_FIXTURE.read_text(encoding="utf-8"))
         evidence = extract_page_category_evidence(
             soup, "Boxe", "https://www.emag.ro/boxe/c?ref=bc")
-        assert evidence == CategoryPathEvidence(
-            tuple(FULL_LEVELS), "visible_breadcrumb", 300)
+        assert evidence.levels == tuple(FULL_LEVELS)
+        assert evidence.source == "json_ld_breadcrumb"
+        assert evidence.category_links_verified is True
+        assert evidence.is_tentative is False
 
     def test_json_ld_breadcrumb_list_extracts_full_path(self):
         payload = {
@@ -99,26 +102,27 @@ class TestPageEvidenceSources:
                 ";</script></body></html>")
         evidence = extract_page_category_evidence(
             _soup(html), "Boxe", "https://www.emag.ro/boxe/c")
-        assert evidence == CategoryPathEvidence(
-            tuple(FULL_LEVELS), "embedded_category_state", 200)
+        assert evidence.levels == tuple(FULL_LEVELS)
+        assert evidence.source == "embedded_category_state"
+        assert evidence.is_tentative is True
 
-    def test_parent_only_breadcrumb_appends_reliable_current_category(self):
+    def test_parent_only_breadcrumb_appends_only_with_category_links(self):
         html = """<html><body><nav aria-label="Breadcrumb"><ol>
-          <li>eMAG</li><li>TV, Audio-Video &amp; Foto</li>
-          <li>Audio HI-FI &amp; Profesionale</li><li>Audio Hi-Fi</li>
+          <li>eMAG</li><li><a href="/tv-audio-video-foto/c">TV, Audio-Video &amp; Foto</a></li>
+          <li><a href="/audio-hi-fi-profesionale/c">Audio HI-FI &amp; Profesionale</a></li>
+          <li><a href="/audio-hi-fi/c">Audio Hi-Fi</a></li>
         </ol></nav><h1>Boxe</h1></body></html>"""
         evidence = extract_page_category_evidence(
             _soup(html), "Boxe", "https://www.emag.ro/boxe/c")
         assert list(evidence.levels) == FULL_LEVELS
 
-    def test_parent_only_breadcrumb_can_use_explicit_h1_when_url_slug_differs(self):
+    def test_parent_only_plain_breadcrumb_is_not_authorized_by_h1(self):
         html = """<html><body><nav aria-label="Breadcrumb"><ol>
           <li>eMAG</li><li>TV, Audio-Video &amp; Foto</li><li>Audio Hi-Fi</li>
         </ol></nav><h1>Boxe</h1></body></html>"""
         evidence = extract_page_category_evidence(
             _soup(html), "Boxe", "https://www.emag.ro/catalog-audio/c")
-        assert list(evidence.levels) == [
-            "TV, Audio-Video & Foto", "Audio Hi-Fi", "Boxe"]
+        assert evidence is None
 
     def test_existing_current_category_is_not_appended_twice(self):
         html = _listing_page(0, breadcrumb=True)
@@ -265,8 +269,12 @@ class TestRegistryConcurrencyAndIsolation:
 
     def test_later_more_complete_path_replaces_shorter_path(self):
         registry = CategoryLevelRegistry()
-        shorter = CategoryPathEvidence(("Audio", "Boxe"), "visible_breadcrumb", 300)
-        complete = CategoryPathEvidence(tuple(FULL_LEVELS), "json_ld_breadcrumb", 300)
+        shorter = CategoryPathEvidence(
+            ("Audio", "Boxe"), "embedded_category_state", 170,
+            is_tentative=True)
+        complete = CategoryPathEvidence(
+            tuple(FULL_LEVELS), "json_ld_breadcrumb", 420,
+            category_links_verified=True, structured_breadcrumb=True)
         registry.register("https://www.emag.ro/boxe/c", shorter)
         assert registry.register("https://www.emag.ro/boxe/c", complete)
         assert registry.get("https://www.emag.ro/boxe/c") == complete
@@ -282,8 +290,12 @@ class TestRegistryConcurrencyAndIsolation:
     def test_multithreaded_registration_preserves_best_per_category(self):
         registry = CategoryLevelRegistry()
         candidates = [
-            CategoryPathEvidence(("Audio", "Boxe"), "embedded_category_state", 200),
-            CategoryPathEvidence(tuple(FULL_LEVELS), "visible_breadcrumb", 300),
+            CategoryPathEvidence(
+                ("Audio", "Boxe"), "embedded_category_state", 170,
+                is_tentative=True),
+            CategoryPathEvidence(
+                tuple(FULL_LEVELS), "visible_breadcrumb", 400,
+                category_links_verified=True),
         ] * 30
         with ThreadPoolExecutor(max_workers=8) as executor:
             list(executor.map(

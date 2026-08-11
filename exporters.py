@@ -89,11 +89,10 @@ class Exporters:
     def _to_output(self, product: dict, *, stringify_extra: bool = False) -> dict:
         evidence = self.get_category_level_evidence(
             str(product.get("category_url") or ""))
-        levels = evidence.levels if evidence else None
         return product_to_output_dict(
             product,
             stringify_extra=stringify_extra,
-            category_levels=levels,
+            category_evidence=evidence,
         )
 
     def write_json(self) -> None:

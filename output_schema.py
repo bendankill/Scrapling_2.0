@@ -7,6 +7,7 @@ from collections import OrderedDict
 from typing import Any, Mapping, Sequence
 
 from category_hierarchy import (
+    CategoryPathEvidence,
     select_product_category_levels,
     split_category_path_all,
 )
@@ -93,9 +94,11 @@ def extract_category_levels(
     extra: Any,
     category_name: str = "",
     verified_levels: Sequence[str] | None = None,
+    category_evidence: CategoryPathEvidence | None = None,
 ) -> list[str]:
     """页面旁路证据优先；缺失时回退商品已有 extra 路径。"""
-    return select_product_category_levels(extra, category_name, verified_levels)
+    return select_product_category_levels(
+        extra, category_name, verified_levels, category_evidence)
 
 
 def translate_extra(extra: Any) -> Any:
@@ -155,12 +158,14 @@ def product_to_output_dict(
     *,
     stringify_extra: bool = False,
     category_levels: Sequence[str] | None = None,
+    category_evidence: CategoryPathEvidence | None = None,
 ) -> dict:
     """在最终导出边界将一个英文内部商品字典转换为中文输出字典。"""
     levels = extract_category_levels(
         product.get("extra"),
         str(product.get("category_name") or ""),
         category_levels,
+        category_evidence,
     )
     output: dict[str, Any] = {}
 
