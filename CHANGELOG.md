@@ -11,6 +11,7 @@
 - **Session generation**: finalize关闭当前代次后原子递增generation；同线程旧thread-local客户端自动失效并创建活动的新Session，保留同代次复用、跨线程隔离和Cookie连续性，重复finalize安全
 - **请求阶段诊断**: `request_call_started` 仅在紧邻调用 `client.get()` 前变为true，新增 `response_received`、generation、活动状态和失败阶段；Cookie、Token、Authorization及API Key值会在异常详情中脱敏
 - **验证**: 新增7个参数化测试函数、86个参数化场景/pytest收集项；专项86项、V2.2.1类目相关189项、parser/crawler/exporter/WAF/分页/图片回归183项通过（2项既有环境条件跳过），完整套件连续两次均为425项通过；并发乱序24项和Session生命周期11项分别连续三次通过
+- **真实HTTP证据**: 功能提交 `95b81ec1...` 上按规定仅请求一次Boxe（`retries=1`），真实返回HTTP 511；程序状态`waf_blocked`、退出码3、无重试、Soup和类目提取均为0。响应正文摘要及空三格式输出哈希见 `REAL_HTTP_EVIDENCE_V2.2.1.md`，未因WAF再次请求
 
 ### 新增
 - **页面真实类目证据**: 从列表页可见面包屑、JSON-LD `BreadcrumbList` 和明确嵌入状态提取类目路径
