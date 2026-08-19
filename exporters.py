@@ -6,7 +6,12 @@ import logging
 import os
 from threading import Lock
 
-from category_hierarchy import CategoryLevelRegistry, CategoryPathEvidence
+from category_hierarchy import (
+    CategoryEvidenceDecision,
+    CategoryEvidenceStatus,
+    CategoryLevelRegistry,
+    CategoryPathEvidence,
+)
 from models import ProductItem
 from output_schema import (
     max_category_level,
@@ -70,12 +75,29 @@ class Exporters:
         """线程安全注册页面级旁路类目证据。"""
         return self._category_levels.register(category_url, evidence)
 
+    def register_category_decision(
+        self,
+        category_url: str,
+        decision: CategoryEvidenceDecision,
+    ) -> bool:
+        """Atomically register accepted evidence or its explicit conflict state."""
+        if decision.status == CategoryEvidenceStatus.FINAL_CONFLICTED:
+            return self._category_levels.register_conflict(category_url, final=True)
+        if decision.status == CategoryEvidenceStatus.TEMPORARY_CONFLICTED:
+            return self._category_levels.register_conflict(category_url, final=False)
+        if decision.evidence:
+            return self._category_levels.register(category_url, decision.evidence)
+        return False
+
     def get_category_level_evidence(
         self,
         category_url: str,
     ) -> CategoryPathEvidence | None:
         """按规范化类目 URL 返回旁路证据副本。"""
         return self._category_levels.get(category_url)
+
+    def get_category_level_state(self, category_url: str) -> CategoryEvidenceStatus:
+        return self._category_levels.get_state(category_url)
 
     def get_csv_buffer(self) -> list[dict]:
         """获取用于 CSV/XLSX 导出的中文数据 (扩展信息转为 JSON 字符串)"""

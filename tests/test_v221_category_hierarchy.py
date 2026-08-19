@@ -264,8 +264,8 @@ class TestRegistryConcurrencyAndIsolation:
         complete = CategoryPathEvidence(tuple(FULL_LEVELS), "visible_breadcrumb", 300)
         shorter = CategoryPathEvidence(("Audio", "Boxe"), "visible_breadcrumb", 300)
         assert registry.register("https://www.emag.ro/boxe/c", complete)
-        assert not registry.register("https://www.emag.ro/boxe/c", shorter)
-        assert registry.get("https://www.emag.ro/boxe/c") == complete
+        assert registry.register("https://www.emag.ro/boxe/c", shorter)
+        assert registry.get("https://www.emag.ro/boxe/c") is None
 
     def test_later_more_complete_path_replaces_shorter_path(self):
         registry = CategoryLevelRegistry()
@@ -312,7 +312,7 @@ class TestCrawlerPerformanceAndReuse:
         crawler = EmagCrawler(str(tmp_path / "out"), download_images=False)
         html = _listing_page(card_count=60, breadcrumb=True)
         calls = {"fetch": 0, "soup": 0, "hierarchy": 0}
-        original_extract = crawler_module.extract_page_category_evidence
+        original_extract = crawler_module.extract_page_category_decision
 
         def fetch(url):
             calls["fetch"] += 1
@@ -328,7 +328,7 @@ class TestCrawlerPerformanceAndReuse:
 
         monkeypatch.setattr(crawler, "_fetch_page", fetch)
         monkeypatch.setattr(crawler, "_parse_html_once", parse_once)
-        monkeypatch.setattr(crawler_module, "extract_page_category_evidence", extract_once)
+        monkeypatch.setattr(crawler_module, "extract_page_category_decision", extract_once)
         result = crawler._fetch_and_parse_page(
             "Boxe", "https://www.emag.ro/boxe/c", 1,
             "https://www.emag.ro/boxe/c")
@@ -336,14 +336,14 @@ class TestCrawlerPerformanceAndReuse:
         assert result.category_levels == FULL_LEVELS
         assert calls == {"fetch": 1, "soup": 1, "hierarchy": 1}
 
-    def test_same_category_second_page_reuses_first_verified_levels(self, tmp_path, monkeypatch):
+    def test_same_category_second_page_confirms_first_verified_levels(self, tmp_path, monkeypatch):
         crawler = EmagCrawler(str(tmp_path / "out"), download_images=False)
         pages = {
             1: _listing_page(card_count=1, breadcrumb=True),
             2: _listing_page(card_count=1, breadcrumb=False),
         }
         calls = {"hierarchy": 0}
-        original_extract = crawler_module.extract_page_category_evidence
+        original_extract = crawler_module.extract_page_category_decision
 
         def fetch(url):
             page = 2 if "/p2/" in url else 1
@@ -354,7 +354,7 @@ class TestCrawlerPerformanceAndReuse:
             return original_extract(soup, name, url)
 
         monkeypatch.setattr(crawler, "_fetch_page", fetch)
-        monkeypatch.setattr(crawler_module, "extract_page_category_evidence", extract_once)
+        monkeypatch.setattr(crawler_module, "extract_page_category_decision", extract_once)
         first = crawler._fetch_and_parse_page(
             "Boxe", "https://www.emag.ro/boxe/c", 1,
             "https://www.emag.ro/boxe/c")
@@ -363,15 +363,15 @@ class TestCrawlerPerformanceAndReuse:
             "https://www.emag.ro/boxe/p2/c")
         assert first.category_levels == second.category_levels == FULL_LEVELS
         assert first.category_levels_from_cache is False
-        assert second.category_levels_from_cache is True
-        assert calls["hierarchy"] == 1
+        assert second.category_levels_from_cache is False
+        assert calls["hierarchy"] == 2
 
     def test_concurrent_same_category_extracts_once(self, tmp_path, monkeypatch):
         crawler = EmagCrawler(str(tmp_path / "out"), download_images=False)
         soup = _soup(_listing_page(1, breadcrumb=True))
         calls = {"count": 0}
         lock = threading.Lock()
-        original_extract = crawler_module.extract_page_category_evidence
+        original_extract = crawler_module.extract_page_category_decision
 
         def slow_extract(page_soup, name, url):
             with lock:
@@ -379,11 +379,12 @@ class TestCrawlerPerformanceAndReuse:
             time.sleep(0.01)
             return original_extract(page_soup, name, url)
 
-        monkeypatch.setattr(crawler_module, "extract_page_category_evidence", slow_extract)
+        monkeypatch.setattr(crawler_module, "extract_page_category_decision", slow_extract)
         with ThreadPoolExecutor(max_workers=8) as executor:
             results = list(executor.map(
                 lambda _index: crawler._get_or_extract_category_evidence(
-                    soup, "Boxe", "https://www.emag.ro/boxe/c?ref=x"),
+                    soup, "Boxe", "https://www.emag.ro/boxe/c?ref=x",
+                    page_number=1),
                 range(20),
             ))
         assert calls["count"] == 1

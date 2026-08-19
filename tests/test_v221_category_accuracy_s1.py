@@ -279,7 +279,7 @@ class TestS1CrawlerCacheUpgrade:
         result, from_cache = crawler._get_or_extract_category_evidence(
             _embedded_page(["Audio", "Boxe"]), "Boxe", "https://www.emag.ro/boxe/p2/c")
         assert list(result.levels) == FULL_LEVELS
-        assert from_cache is True
+        assert from_cache is False
 
     def test_low_embedded_cache_upgrades_to_verified_breadcrumb(self, tmp_path):
         crawler = EmagCrawler(str(tmp_path / "out"), download_images=False)
@@ -293,22 +293,26 @@ class TestS1CrawlerCacheUpgrade:
         assert list(result.levels) == FULL_LEVELS
         assert result.category_links_verified is True
 
-    def test_final_cache_ignores_later_conflict(self, tmp_path, monkeypatch):
+    def test_final_cache_detects_later_final_conflict(self, tmp_path, monkeypatch):
         crawler = EmagCrawler(str(tmp_path / "out"), download_images=False)
         crawler.exporters.register_category_levels(
             "https://www.emag.ro/boxe/c", _final_evidence())
         calls = {"count": 0}
 
-        def should_not_extract(*_args):
+        def conflicting_decision(*_args):
             calls["count"] += 1
-            return _final_evidence(["Marketplace", "Boxe"])
+            from category_hierarchy import CategoryEvidenceDecision, CategoryEvidenceStatus
+            return CategoryEvidenceDecision(
+                CategoryEvidenceStatus.FINAL,
+                _final_evidence(["Marketplace", "Boxe"]))
 
-        monkeypatch.setattr(crawler_module, "extract_page_category_evidence", should_not_extract)
+        monkeypatch.setattr(crawler_module, "extract_page_category_decision", conflicting_decision)
         result, from_cache = crawler._get_or_extract_category_evidence(
-            _soup("<html></html>"), "Boxe", "https://www.emag.ro/boxe/p2/c")
-        assert list(result.levels) == FULL_LEVELS
-        assert from_cache is True
-        assert calls["count"] == 0
+            _soup("<html></html>"), "Boxe", "https://www.emag.ro/boxe/p2/c",
+            page_number=2)
+        assert result is None
+        assert from_cache is False
+        assert calls["count"] == 1
 
     def test_concurrent_same_category_converges_on_best_evidence(self, tmp_path):
         crawler = EmagCrawler(str(tmp_path / "out"), download_images=False)
@@ -346,17 +350,18 @@ class TestS1CrawlerCacheUpgrade:
     def test_tentative_cache_upgrade_scans_are_bounded(self, tmp_path, monkeypatch):
         crawler = EmagCrawler(str(tmp_path / "out"), download_images=False)
         calls = {"count": 0}
-        original = crawler_module.extract_page_category_evidence
+        original = crawler_module.extract_page_category_decision
 
         def counted(*args):
             calls["count"] += 1
             return original(*args)
 
-        monkeypatch.setattr(crawler_module, "extract_page_category_evidence", counted)
+        monkeypatch.setattr(crawler_module, "extract_page_category_decision", counted)
         soup = _embedded_page(["Audio", "Boxe"])
         for page in range(1, 20):
             crawler._get_or_extract_category_evidence(
-                soup, "Boxe", f"https://www.emag.ro/boxe/p{page}/c")
+                soup, "Boxe", f"https://www.emag.ro/boxe/p{page}/c",
+                page_number=page)
         assert calls["count"] == crawler._category_level_max_upgrade_checks == 3
 
 

@@ -13,6 +13,7 @@ from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 
 from category_hierarchy import (
+    CategoryEvidenceStatus,
     CategoryLevelRegistry,
     CategoryPathEvidence,
     extract_page_category_evidence,
@@ -229,14 +230,19 @@ class TestStrictBreadcrumbOriginAndIdentity:
          ["TV", "Audio", "Audio Hi-Fi", "Boxe"]),
         (_other_final(["TV", "Audio", "Boxe"]),
          _other_final(["Marketplace", "Audio", "Boxe"]),
-         ["TV", "Audio", "Boxe"]),
+         None),
     ],
 )
 def test_registry_trust_replacement_matrix(first, second, expected):
     registry = CategoryLevelRegistry()
     registry.register(BOXE_URL, first)
     registry.register(BOXE_URL, second)
-    assert list(registry.get(BOXE_URL).levels) == expected
+    result = registry.get(BOXE_URL)
+    if expected is None:
+        assert result is None
+        assert registry.get_state(BOXE_URL) == CategoryEvidenceStatus.FINAL_CONFLICTED
+    else:
+        assert list(result.levels) == expected
 
 
 class TestCacheTrustCrawlerAndConcurrency:
@@ -245,8 +251,9 @@ class TestCacheTrustCrawlerAndConcurrency:
         first = _final(["TV", "Audio", "Boxe"])
         longer = _final(["Marketplace", "Recomandari", "Audio", "Boxe"])
         assert registry.register(BOXE_URL, first)
-        assert not registry.register(BOXE_URL, longer)
-        assert registry.get(BOXE_URL) == first
+        assert registry.register(BOXE_URL, longer)
+        assert registry.get(BOXE_URL) is None
+        assert registry.get_state(BOXE_URL) == CategoryEvidenceStatus.FINAL_CONFLICTED
 
     def test_concurrent_random_order_converges_to_verified_evidence(self):
         registry = CategoryLevelRegistry()
@@ -274,14 +281,14 @@ class TestCacheTrustCrawlerAndConcurrency:
         assert result.is_tentative is False
         assert from_cache is False
 
-    def test_final_cache_skips_later_tentative_page(self, tmp_path):
+    def test_final_cache_observes_but_rejects_later_tentative_page(self, tmp_path):
         crawler = EmagCrawler(str(tmp_path / "out"), download_images=False)
         crawler.exporters.register_category_levels(
             BOXE_URL, _final(["Audio", "Boxe"]))
         result, from_cache = crawler._get_or_extract_category_evidence(
             _soup("<html></html>"), "Boxe", "https://www.emag.ro/boxe/p2/c")
         assert list(result.levels) == ["Audio", "Boxe"]
-        assert from_cache is True
+        assert from_cache is False
 
     def test_third_upgrade_scan_can_install_final_evidence(self, tmp_path):
         crawler = EmagCrawler(str(tmp_path / "out"), download_images=False)

@@ -2,6 +2,7 @@
 爬虫核心 V2.1.2: 纯HTTP, 顺序提交, 全部卡片保留
 """
 import hashlib, json, logging, os, time, threading
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -9,8 +10,10 @@ from threading import Lock, Semaphore, Event
 from typing import Optional
 from scrapling.fetchers import FetcherSession
 from category_hierarchy import (
+    CategoryEvidenceDecision,
+    CategoryEvidenceStatus,
     CategoryPathEvidence,
-    extract_page_category_evidence,
+    extract_page_category_decision,
     normalize_category_url,
 )
 from models import ProductItem
@@ -34,6 +37,20 @@ CATEGORY_UNAVAILABLE_MARKERS = (
     "aceasta categorie nu exista",
     "această categorie nu există",
 )
+
+_SENSITIVE_DIAGNOSTIC_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*[:=]\s*)([^;,\s]+(?:\s+[^;,\s]+)?)"),
+    re.compile(r"(?i)(cookie\s*[:=]\s*)([^;,\s]+)"),
+    re.compile(r"(?i)((?:access[_-]?)?token\s*[:=]\s*)([^;,\s]+)"),
+    re.compile(r"(?i)(api[_-]?key\s*[:=]\s*)([^;,\s]+)"),
+)
+
+
+def _sanitize_diagnostic_text(value) -> str:
+    text = str(value or "")
+    for pattern in _SENSITIVE_DIAGNOSTIC_PATTERNS:
+        text = pattern.sub(r"\1[REDACTED]", text)
+    return text
 
 
 @dataclass
@@ -63,6 +80,7 @@ class PageResult:
     category_level_source: str = ""
     category_level_reliability: int = 0
     category_levels_from_cache: bool = False
+    category_evidence_decision: Optional[CategoryEvidenceDecision] = None
 
 
 @dataclass
@@ -77,6 +95,9 @@ class FetchResult:
     fetched_at: str = ""
     error_type: str = ""
     error_detail: str = ""
+    request_call_started: bool = False
+    response_received: bool = False
+    session_generation: int = 0
 
 
 class CategoryStats:
@@ -125,6 +146,7 @@ class EmagCrawler:
         self._session_config = {"impersonate": "chrome136", "stealthy_headers": True,
                                 "timeout": 30, "retries": 3, "retry_delay": 1}
         self._all_sessions: list = []; self._sessions_lock = Lock()
+        self._session_generation = 0
         self._cat_page_hashes: dict[str, set] = {}; self._hash_lock = Lock()
         # 运行内唯一商品键集合 (替代已删除的 checkpoint)
         self._product_keys: set = set()
@@ -132,6 +154,7 @@ class EmagCrawler:
         self._category_level_locks: dict[str, Lock] = {}
         self._category_level_locks_guard = Lock()
         self._category_level_upgrade_checks: dict[str, int] = {}
+        self._category_level_observed_pages: dict[str, set[int]] = {}
         self._category_level_max_upgrade_checks = 3
         os.makedirs(output_dir, exist_ok=True)
 
@@ -145,20 +168,72 @@ class EmagCrawler:
         return value
 
     def _get_client(self):
-        if not hasattr(self._thread_local, 'client'):
-            self._validated_session_retries()
-            mgr = FetcherSession(**self._session_config)
-            client = mgr.__enter__()
-            self._thread_local.mgr = mgr; self._thread_local.client = client
-            with self._sessions_lock: self._all_sessions.append((mgr, client))
-        return self._thread_local.client
+        self._validated_session_retries()
+        with self._sessions_lock:
+            generation = self._session_generation
+            manager = getattr(self._thread_local, "mgr", None)
+            client = getattr(self._thread_local, "client", None)
+            local_generation = getattr(
+                self._thread_local, "session_generation", None)
+            if (client is not None and local_generation == generation and
+                    self._session_is_active(manager, client)):
+                return client
+
+            manager = FetcherSession(**self._session_config)
+            client = manager.__enter__()
+            if not self._session_is_active(manager, client):
+                try:
+                    manager.__exit__(None, None, None)
+                finally:
+                    raise RuntimeError("FetcherSession did not enter an active state")
+            self._thread_local.mgr = manager
+            self._thread_local.client = client
+            self._thread_local.session_generation = generation
+            self._all_sessions.append((manager, client))
+            return client
+
+    @staticmethod
+    def _session_is_active(manager, client) -> bool:
+        if manager is None or client is None:
+            return False
+        alive = getattr(manager, "_is_alive", None)
+        if alive is not None:
+            return bool(alive)
+        closed = getattr(client, "closed", None)
+        if closed is not None:
+            return not bool(closed)
+        return True
+
+    def _session_diagnostic_snapshot(self) -> dict:
+        manager = getattr(self._thread_local, "mgr", None)
+        client = getattr(self._thread_local, "client", None)
+        local_generation = getattr(
+            self._thread_local, "session_generation", None)
+        with self._sessions_lock:
+            generation = self._session_generation
+        current_generation = local_generation == generation
+        return {
+            "manager_entered": manager is not None and current_generation,
+            "client_stored": client is not None and current_generation,
+            "session_generation": generation,
+            "client_generation": local_generation,
+            "session_active": (current_generation and
+                               self._session_is_active(manager, client)),
+        }
+
+    def _validate_client_before_request(self, client) -> None:
+        manager = getattr(self._thread_local, "mgr", None)
+        if not self._session_is_active(manager, client):
+            raise RuntimeError("FetcherSession is not active before client.get()")
 
     def _close_all_sessions(self):
         with self._sessions_lock:
-            for mgr, client in list(self._all_sessions):
-                try: mgr.__exit__(None, None, None)
-                except Exception: pass
+            sessions = list(self._all_sessions)
             self._all_sessions.clear()
+            self._session_generation += 1
+        for mgr, _client in sessions:
+            try: mgr.__exit__(None, None, None)
+            except Exception: pass
 
     # ---- 原子产品键 (运行内) ----
     def _check_and_add_product_keys(self, keys: list) -> tuple:
@@ -176,9 +251,18 @@ class EmagCrawler:
         if self._stop_event.is_set():
             return FetchResult(request_url=url, final_url=url,
                                fetched_at=fetched_at)
+        request_call_started = False
+        response_received = False
+        client = None
         with self.global_semaphore:
             try:
-                page = self._get_client().get(url)
+                client = self._get_client()
+                self._validate_client_before_request(client)
+                # This means client.get() is now being invoked; it does not
+                # claim that a network packet reached the remote host.
+                request_call_started = True
+                page = client.get(url)
+                response_received = True
                 html = page.html_content or ""
                 final_url = str(getattr(page, "url", "") or
                                 getattr(page, "response_url", "") or url)
@@ -204,23 +288,47 @@ class EmagCrawler:
                     content_type=content_type,
                     content_length=len(html.encode("utf-8")),
                     fetched_at=fetched_at,
+                    request_call_started=request_call_started,
+                    response_received=response_received,
+                    session_generation=self._session_diagnostic_snapshot()[
+                        "session_generation"],
                 )
             except Exception as e:
                 retries = self._session_config.get("retries")
-                manager_entered = hasattr(self._thread_local, "mgr")
-                client_stored = hasattr(self._thread_local, "client")
+                session = self._session_diagnostic_snapshot()
+                safe_error = _sanitize_diagnostic_text(e)
+                if not request_call_started:
+                    if isinstance(e, ValueError):
+                        phase = "configuration_validation"
+                    elif client is None:
+                        phase = "session_creation"
+                    else:
+                        phase = "before_client_get"
+                elif not response_received:
+                    phase = "inside_client_get"
+                else:
+                    phase = "response_processing"
                 detail = (
-                    f"{type(e).__name__}: {e}; retries={retries!r}; "
-                    f"manager_entered={manager_entered}; "
-                    f"client_stored={client_stored}; "
+                    f"{type(e).__name__}: {safe_error}; retries={retries!r}; "
+                    f"phase={phase}; "
+                    f"manager_entered={session['manager_entered']}; "
+                    f"client_stored={session['client_stored']}; "
+                    f"session_generation={session['session_generation']}; "
+                    f"client_generation={session['client_generation']!r}; "
+                    f"session_active={session['session_active']}; "
                     f"thread_id={threading.get_ident()}; "
-                    "request_call_started=True"
+                    f"request_call_started={request_call_started}; "
+                    f"response_received={response_received}"
                 )
                 logger.error(f"HTTP [{url}]: {detail}")
                 return FetchResult(request_url=url, final_url=url,
                                    fetched_at=fetched_at,
                                    error_type=type(e).__name__,
-                                   error_detail=detail)
+                                   error_detail=detail,
+                                   request_call_started=request_call_started,
+                                   response_received=response_received,
+                                   session_generation=session[
+                                       "session_generation"])
 
     # ---- 页面去重 ----
     def _cat_key(self, base_url): return base_url.lower().rstrip("/")
@@ -295,12 +403,14 @@ class EmagCrawler:
 
         if products:
             evidence, from_cache = self._get_or_extract_category_evidence(
-                soup, name, base_url)
+                soup, name, base_url, page_number=page_num)
             if evidence:
                 pr.category_levels = list(evidence.levels)
                 pr.category_level_source = evidence.source
                 pr.category_level_reliability = evidence.reliability
                 pr.category_levels_from_cache = from_cache
+            pr.category_evidence_decision = getattr(
+                self._thread_local, "last_category_evidence_decision", None)
             return pr
 
         if parse_errors:
@@ -368,33 +478,41 @@ class EmagCrawler:
         soup,
         category_name: str,
         category_url: str,
+        page_number: int | None = None,
     ) -> tuple[Optional[CategoryPathEvidence], bool]:
-        """同一类目只提取一次页面层级；不同类目使用独立锁和缓存键。"""
-        cached = self.exporters.get_category_level_evidence(category_url)
-        if cached and not cached.is_tentative:
-            return cached, True
-
+        """Observe at most logical pages 1-3; every observed page is resolved once."""
         cache_key = normalize_category_url(category_url)
         with self._category_level_locks_guard:
             category_lock = self._category_level_locks.setdefault(
                 cache_key, Lock())
         with category_lock:
             cached = self.exporters.get_category_level_evidence(category_url)
-            if cached and not cached.is_tentative:
-                return cached, True
             checks = self._category_level_upgrade_checks.get(cache_key, 0)
-            if cached and checks >= self._category_level_max_upgrade_checks:
+            observed = self._category_level_observed_pages.setdefault(
+                cache_key, set())
+            if page_number is not None:
+                if page_number < 1 or page_number > self._category_level_max_upgrade_checks:
+                    self._thread_local.last_category_evidence_decision = None
+                    return cached, True
+                if page_number in observed:
+                    self._thread_local.last_category_evidence_decision = None
+                    return cached, True
+                observation_id = page_number
+            else:
+                if checks >= self._category_level_max_upgrade_checks:
+                    self._thread_local.last_category_evidence_decision = None
+                    return cached, True
+                observation_id = checks + 1
+            if checks >= self._category_level_max_upgrade_checks:
+                self._thread_local.last_category_evidence_decision = None
                 return cached, True
+            observed.add(observation_id)
             self._category_level_upgrade_checks[cache_key] = checks + 1
-            evidence = extract_page_category_evidence(
+            decision = extract_page_category_decision(
                 soup, category_name, category_url)
-            if evidence:
-                self.exporters.register_category_levels(category_url, evidence)
-                return (self.exporters.get_category_level_evidence(category_url)
-                        or evidence), False
-            if cached:
-                return cached, False
-        return None, False
+            self._thread_local.last_category_evidence_decision = decision
+            self.exporters.register_category_decision(category_url, decision)
+            return self.exporters.get_category_level_evidence(category_url), False
 
     def _save_unknown_http200_diagnostic(self, name, pr: PageResult,
                                          html: str) -> list[str]:

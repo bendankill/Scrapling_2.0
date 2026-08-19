@@ -6,6 +6,7 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass, replace
+from enum import Enum
 from threading import RLock
 from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urljoin, urlparse
@@ -41,8 +42,19 @@ class CategoryPathEvidence:
 
 
 @dataclass(frozen=True)
+class CategoryBreadcrumbNode:
+    """One indivisible breadcrumb item; metadata never drifts from its name."""
+
+    name: str
+    source: str
+    url: str = ""
+    category_id: str = ""
+    position: int | None = None
+
+
+@dataclass(frozen=True)
 class _PathDescriptor:
-    levels: tuple[str, ...]
+    nodes: tuple[CategoryBreadcrumbNode, ...]
     source: str
     parent_links_verified: bool = False
     all_nodes_verified: bool = False
@@ -51,6 +63,34 @@ class _PathDescriptor:
     has_noncategory_link: bool = False
     leaf_link: str = ""
     has_invalid_leaf_link: bool = False
+
+    @property
+    def levels(self) -> tuple[str, ...]:
+        return tuple(node.name for node in self.nodes)
+
+
+class CategoryEvidenceStatus(str, Enum):
+    MISSING = "missing"
+    TEMPORARY = "temporary"
+    TEMPORARY_CONFLICTED = "temporary_conflicted"
+    FINAL = "final"
+    FINAL_CONFLICTED = "final_conflicted"
+
+
+@dataclass(frozen=True)
+class CategoryEvidenceDecision:
+    """Deterministic result after all page candidates have been collected."""
+
+    status: CategoryEvidenceStatus
+    evidence: CategoryPathEvidence | None = None
+    candidate_count: int = 0
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class CategoryRegistryEntry:
+    status: CategoryEvidenceStatus
+    evidence: CategoryPathEvidence | None = None
 
 
 def normalize_category_name(value: Any) -> str:
@@ -116,6 +156,41 @@ def clean_category_levels(raw_levels: Any) -> list[str]:
             continue
         seen.add(normalized)
         cleaned.append(value)
+    return cleaned
+
+
+def _clean_breadcrumb_nodes(
+    raw_nodes: Sequence[CategoryBreadcrumbNode],
+) -> list[CategoryBreadcrumbNode]:
+    """Sort, trim, de-root and de-duplicate whole nodes without metadata slicing."""
+    indexed: list[tuple[int, CategoryBreadcrumbNode]] = []
+    for index, node in enumerate(raw_nodes):
+        name = str(node.name or "").strip()
+        if not name:
+            continue
+        position = node.position
+        if isinstance(position, bool) or not isinstance(position, int) or position < 1:
+            position = index + 1
+        indexed.append((index, replace(
+            node,
+            name=name,
+            url=str(node.url or "").strip(),
+            category_id=str(node.category_id or "").strip(),
+            position=position,
+        )))
+    indexed.sort(key=lambda item: (item[1].position or item[0] + 1, item[0]))
+    nodes = [node for _index, node in indexed]
+    while nodes and normalize_category_name(nodes[0].name) in ROOT_CATEGORY_NAMES:
+        nodes.pop(0)
+
+    cleaned: list[CategoryBreadcrumbNode] = []
+    seen: set[str] = set()
+    for node in nodes:
+        normalized = normalize_category_name(node.name)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned.append(node)
     return cleaned
 
 
@@ -192,34 +267,59 @@ def _prefer_consistent(
     return left if _evidence_strength(left) >= _evidence_strength(right) else right
 
 
+def _deterministic_preference_key(
+    evidence: CategoryPathEvidence,
+) -> tuple[int, int, int, int, tuple[str, ...], str]:
+    return (
+        len(evidence.levels),
+        evidence.reliability,
+        int(evidence.structured_breadcrumb),
+        int(evidence.current_category_explicit),
+        tuple(normalize_category_name(level) for level in evidence.levels),
+        evidence.source,
+    )
+
+
+def decide_category_evidence(
+    candidates: Iterable[CategoryPathEvidence],
+) -> CategoryEvidenceDecision:
+    """Resolve a complete candidate set without depending on traversal order."""
+    valid = [candidate for candidate in candidates if candidate.levels]
+    if not valid:
+        return CategoryEvidenceDecision(CategoryEvidenceStatus.MISSING)
+
+    finals = [candidate for candidate in valid if not candidate.is_tentative]
+    active = finals or valid
+    conflict_status = (
+        CategoryEvidenceStatus.FINAL_CONFLICTED
+        if finals else CategoryEvidenceStatus.TEMPORARY_CONFLICTED)
+    accepted_status = (
+        CategoryEvidenceStatus.FINAL
+        if finals else CategoryEvidenceStatus.TEMPORARY)
+
+    ordered = sorted(active, key=_deterministic_preference_key, reverse=True)
+    best = ordered[0]
+    for candidate in ordered[1:]:
+        if not category_paths_are_consistent(best.levels, candidate.levels):
+            return CategoryEvidenceDecision(
+                conflict_status,
+                candidate_count=len(valid),
+                reason="same-trust page category paths conflict",
+            )
+        best = _prefer_consistent(best, candidate)
+    return CategoryEvidenceDecision(
+        accepted_status,
+        _copy_evidence(best),
+        candidate_count=len(valid),
+        reason="all accepted page paths are consistent",
+    )
+
+
 def select_best_category_evidence(
     candidates: Iterable[CategoryPathEvidence],
 ) -> CategoryPathEvidence | None:
-    """Choose by semantic evidence first; length only completes a consistent chain."""
-    valid = [candidate for candidate in candidates if candidate.levels]
-    if not valid:
-        return None
-
-    best = valid[0]
-    for candidate in valid[1:]:
-        if category_paths_are_consistent(best.levels, candidate.levels):
-            best = _prefer_consistent(best, candidate)
-            continue
-        if (not best.is_tentative and not candidate.is_tentative and
-                (best.category_links_verified or best.structured_breadcrumb) and
-                (candidate.category_links_verified or
-                 candidate.structured_breadcrumb)):
-            # Conflicting independently verified chains are ambiguous; source
-            # rank must not turn either one into a guess.
-            return None
-        best_strength = _evidence_strength(best)
-        candidate_strength = _evidence_strength(candidate)
-        if candidate_strength > best_strength and not candidate.is_tentative:
-            best = candidate
-        elif candidate_strength == best_strength:
-            # Two equally strong, conflicting page chains are ambiguous.
-            return None
-    return best
+    """Compatibility wrapper returning no public evidence for any conflict."""
+    return decide_category_evidence(candidates).evidence
 
 
 def extract_page_category_evidence(
@@ -227,9 +327,19 @@ def extract_page_category_evidence(
     current_category: str,
     page_url: str,
 ) -> CategoryPathEvidence | None:
-    """Extract hierarchy once from the existing page Soup; never reparses HTML."""
+    """Compatibility wrapper for callers that only need accepted evidence."""
+    return extract_page_category_decision(
+        soup, current_category, page_url).evidence
+
+
+def extract_page_category_decision(
+    soup: Any,
+    current_category: str,
+    page_url: str,
+) -> CategoryEvidenceDecision:
+    """Collect every page candidate, then resolve once without order bias."""
     if soup is None or not str(current_category or "").strip():
-        return None
+        return CategoryEvidenceDecision(CategoryEvidenceStatus.MISSING)
 
     candidates: list[CategoryPathEvidence] = []
     for descriptor in _visible_breadcrumb_paths(soup, page_url):
@@ -254,7 +364,7 @@ def extract_page_category_evidence(
                 validation_reason="embedded path has an explicit current-category leaf",
             ))
 
-    return select_best_category_evidence(candidates)
+    return decide_category_evidence(candidates)
 
 
 def _descriptor_to_evidence(
@@ -285,15 +395,21 @@ def _descriptor_to_evidence(
         return None
     appended = not explicit
     structured = descriptor.structured_breadcrumb
-    final = verified
+    # A structured BreadcrumbList with an explicit leaf is independently
+    # meaningful even when optional URLs are absent. Parent-only paths still
+    # require verified links/IDs before the current category may be appended.
+    final = verified or (structured and explicit)
     if descriptor.source == "json_ld_breadcrumb":
         reliability = 420 if verified else 230
     else:
         reliability = 400 if verified else 220
     reason = (
-        "parent category nodes have verified category links"
-        if appended else
-        "current category is the explicit breadcrumb leaf"
+        "parent category nodes have verified category links or IDs"
+        if appended else (
+            "structured breadcrumb has an explicit current-category leaf"
+            if structured and not verified else
+            "current category is the explicit verified breadcrumb leaf"
+        )
     )
     return CategoryPathEvidence(
         tuple(levels), descriptor.source, reliability,
@@ -399,10 +515,10 @@ def _select_page_and_product_evidence(
 
 
 class CategoryLevelRegistry:
-    """Thread-safe side-channel cache that allows upgrades and forbids downgrades."""
+    """Atomic category evidence state machine with sticky final conflicts."""
 
     def __init__(self) -> None:
-        self._entries: dict[str, CategoryPathEvidence] = {}
+        self._entries: dict[str, CategoryRegistryEntry] = {}
         self._lock = RLock()
 
     def register(self, category_url: str, evidence: CategoryPathEvidence) -> bool:
@@ -418,18 +534,52 @@ class CategoryLevelRegistry:
             self._entries[key] = replacement
             return True
 
+    def register_conflict(self, category_url: str, *, final: bool) -> bool:
+        """Atomically record a page-local conflict at its actual trust level."""
+        key = normalize_category_url(category_url)
+        if not key:
+            return False
+        conflict_status = (
+            CategoryEvidenceStatus.FINAL_CONFLICTED
+            if final else CategoryEvidenceStatus.TEMPORARY_CONFLICTED)
+        with self._lock:
+            existing = self._entries.get(key)
+            replacement = _registry_conflict_replacement(
+                existing, conflict_status)
+            if replacement == existing:
+                return False
+            self._entries[key] = replacement
+            return True
+
     def get(self, category_url: str) -> CategoryPathEvidence | None:
         key = normalize_category_url(category_url)
         if not key:
             return None
         with self._lock:
-            evidence = self._entries.get(key)
-            return _copy_evidence(evidence) if evidence else None
+            entry = self._entries.get(key)
+            if entry is None or entry.status in {
+                    CategoryEvidenceStatus.TEMPORARY_CONFLICTED,
+                    CategoryEvidenceStatus.FINAL_CONFLICTED}:
+                return None
+            return _copy_evidence(entry.evidence) if entry.evidence else None
 
-    def snapshot(self) -> dict[str, CategoryPathEvidence]:
+    def get_state(self, category_url: str) -> CategoryEvidenceStatus:
+        key = normalize_category_url(category_url)
+        if not key:
+            return CategoryEvidenceStatus.MISSING
         with self._lock:
-            return {key: _copy_evidence(value)
-                    for key, value in self._entries.items()}
+            entry = self._entries.get(key)
+            return entry.status if entry else CategoryEvidenceStatus.MISSING
+
+    def snapshot(self) -> dict[str, CategoryRegistryEntry]:
+        with self._lock:
+            return {
+                key: CategoryRegistryEntry(
+                    value.status,
+                    _copy_evidence(value.evidence) if value.evidence else None,
+                )
+                for key, value in self._entries.items()
+            }
 
 
 def _copy_evidence(evidence: CategoryPathEvidence) -> CategoryPathEvidence:
@@ -437,20 +587,53 @@ def _copy_evidence(evidence: CategoryPathEvidence) -> CategoryPathEvidence:
 
 
 def _registry_replacement(
-    existing: CategoryPathEvidence | None,
+    existing: CategoryRegistryEntry | None,
     candidate: CategoryPathEvidence,
-) -> CategoryPathEvidence | None:
+) -> CategoryRegistryEntry:
+    candidate_status = (
+        CategoryEvidenceStatus.TEMPORARY
+        if candidate.is_tentative else CategoryEvidenceStatus.FINAL)
+    candidate_entry = CategoryRegistryEntry(candidate_status, candidate)
     if existing is None:
-        return candidate
-    if category_paths_are_consistent(existing.levels, candidate.levels):
-        preferred = _prefer_consistent(existing, candidate)
-        return preferred
-    # Conflicting evidence only replaces an unresolved tentative entry with
-    # stronger, independently verified category evidence.
-    if (existing.is_tentative and not candidate.is_tentative and
-            _evidence_strength(candidate) > _evidence_strength(existing)):
-        return candidate
+        return candidate_entry
+    if existing.status == CategoryEvidenceStatus.FINAL_CONFLICTED:
+        return existing
+    if existing.status == CategoryEvidenceStatus.TEMPORARY_CONFLICTED:
+        return candidate_entry if not candidate.is_tentative else existing
+    current = existing.evidence
+    if current is None:
+        return candidate_entry
+
+    current_final = existing.status == CategoryEvidenceStatus.FINAL
+    candidate_final = not candidate.is_tentative
+    if current_final and not candidate_final:
+        return existing
+    if not current_final and candidate_final:
+        return candidate_entry
+    if category_paths_are_consistent(current.levels, candidate.levels):
+        preferred = _prefer_consistent(current, candidate)
+        return CategoryRegistryEntry(existing.status, preferred)
+    if current_final and candidate_final:
+        return CategoryRegistryEntry(CategoryEvidenceStatus.FINAL_CONFLICTED)
+    if not current_final and not candidate_final:
+        return CategoryRegistryEntry(CategoryEvidenceStatus.TEMPORARY_CONFLICTED)
     return existing
+
+
+def _registry_conflict_replacement(
+    existing: CategoryRegistryEntry | None,
+    conflict_status: CategoryEvidenceStatus,
+) -> CategoryRegistryEntry:
+    if existing is None:
+        return CategoryRegistryEntry(conflict_status)
+    if existing.status == CategoryEvidenceStatus.FINAL_CONFLICTED:
+        return existing
+    if conflict_status == CategoryEvidenceStatus.FINAL_CONFLICTED:
+        return CategoryRegistryEntry(CategoryEvidenceStatus.FINAL_CONFLICTED)
+    if existing.status == CategoryEvidenceStatus.FINAL:
+        # Lower-trust temporary conflicts cannot disable accepted final proof.
+        return existing
+    return CategoryRegistryEntry(CategoryEvidenceStatus.TEMPORARY_CONFLICTED)
 
 
 def _origin_key(parsed: Any) -> tuple[str, str, int | None]:
@@ -492,19 +675,128 @@ def _leaf_category_url_matches(value: Any, page_url: str) -> bool:
         page_url)
 
 
-def _node_category_href(node: Any) -> str:
-    link = node if getattr(node, "name", None) == "a" else node.find("a", href=True)
-    return str(link.get("href") or "") if link else ""
+def _itemprop_tokens(node: Any) -> set[str]:
+    return {
+        token.casefold()
+        for token in str(node.get("itemprop") or "").split()
+        if token.strip()
+    }
+
+
+def _category_id_value(*nodes: Any) -> str:
+    for node in nodes:
+        if node is None:
+            continue
+        candidates = [node]
+        if hasattr(node, "find_all"):
+            candidates.extend(node.find_all(True))
+        for current in candidates:
+            for name in ("data-category-id", "category-id"):
+                value = str(current.get(name) or "").strip()
+                if value:
+                    return value
+    return ""
 
 
 def _has_category_id(node: Any) -> bool:
-    for current in (node, node.find(True) if hasattr(node, "find") else None):
-        if current is None:
-            continue
-        for name in ("data-category-id", "category-id"):
-            if str(current.get(name) or "").strip():
-                return True
-    return False
+    return bool(_category_id_value(node))
+
+
+def _find_itemprop_node(node: Any, itemprop: str) -> Any:
+    wanted = itemprop.casefold()
+    if wanted in _itemprop_tokens(node):
+        return node
+    for candidate in node.find_all(True):
+        if wanted in _itemprop_tokens(candidate):
+            return candidate
+    return None
+
+
+def _bounded_breadcrumb_link(item: Any, name_node: Any) -> Any:
+    """Find a URL only inside the current logical item, including name parents."""
+    if getattr(item, "name", None) in {"a", "link"} and item.get("href"):
+        return item
+    if name_node is not None:
+        if getattr(name_node, "name", None) in {"a", "link"} and name_node.get("href"):
+            return name_node
+        nested = name_node.find(["a", "link"], href=True)
+        if nested:
+            return nested
+        current = getattr(name_node, "parent", None)
+        while current is not None:
+            if getattr(current, "name", None) in {"a", "link"} and current.get("href"):
+                return current
+            if current is item:
+                break
+            current = getattr(current, "parent", None)
+    item_link = _find_itemprop_node(item, "item")
+    if item_link is not None and item_link.get("href"):
+        return item_link
+    return item.find(["a", "link"], href=True)
+
+
+def _breadcrumb_item_position(item: Any, fallback: int) -> int:
+    raw = item.get("position")
+    position_node = _find_itemprop_node(item, "position")
+    if position_node is not None:
+        raw = (position_node.get("content") or position_node.get("value") or
+               position_node.get_text(" ", strip=True) or raw)
+    try:
+        value = int(raw)
+        return value if value > 0 else fallback
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _breadcrumb_node_from_item(
+    item: Any,
+    *,
+    source: str,
+    fallback_position: int,
+) -> CategoryBreadcrumbNode | None:
+    name_node = _find_itemprop_node(item, "name")
+    if name_node is not None:
+        name = str(name_node.get("content") or
+                   name_node.get_text(" ", strip=True) or "").strip()
+    else:
+        name = str(item.get("content") or
+                   item.get_text(" ", strip=True) or "").strip()
+    if not name or name in {"/", ">", "›", "»"}:
+        return None
+    link = _bounded_breadcrumb_link(item, name_node)
+    url = str(link.get("href") or "").strip() if link else ""
+    return CategoryBreadcrumbNode(
+        name=name,
+        source=source,
+        url=url,
+        category_id=_category_id_value(item, name_node, link),
+        position=_breadcrumb_item_position(item, fallback_position),
+    )
+
+
+def _breadcrumb_items(container: Any) -> list[Any]:
+    schema_items = [
+        node for node in container.find_all(True)
+        if "itemlistelement" in _itemprop_tokens(node)
+    ]
+    if schema_items:
+        # Nested descendants that repeat itemListElement are not separate items.
+        return [
+            node for node in schema_items
+            if not any(
+                ancestor is not container and
+                "itemlistelement" in _itemprop_tokens(ancestor)
+                for ancestor in node.parents
+                if ancestor is not None
+            )
+        ]
+    list_items = container.find_all("li")
+    if list_items:
+        return list_items
+    anchors = container.find_all("a", href=True)
+    if anchors:
+        return anchors
+    return container.find_all("span", recursive=True)
 
 
 def _is_breadcrumb_container(node: Any) -> bool:
@@ -543,30 +835,21 @@ def _visible_breadcrumb_paths(
         if (_inside_ignored_breadcrumb_area(container) or
                 not _is_visible_element(container)):
             continue
-        name_nodes = container.select("[itemprop='name']")
-        nodes = name_nodes or container.find_all("li") or container.select("a, span")
-        values: list[str] = []
-        links: list[str] = []
-        category_ids: list[bool] = []
-        for node in nodes:
-            if not _is_visible_element(node):
+        raw_nodes: list[CategoryBreadcrumbNode] = []
+        items = _breadcrumb_items(container)
+        for index, item in enumerate(items, 1):
+            if not _is_visible_element(item):
                 continue
-            text = node.get_text(" ", strip=True)
-            if not text or text in {"/", ">", "›", "»"}:
-                continue
-            values.append(text)
-            links.append(_node_category_href(node))
-            category_ids.append(_has_category_id(node))
-        levels = clean_category_levels(values)
-        if not levels:
+            node = _breadcrumb_node_from_item(
+                item, source="visible_breadcrumb", fallback_position=index)
+            if node:
+                raw_nodes.append(node)
+        nodes = _clean_breadcrumb_nodes(raw_nodes)
+        if not nodes:
             continue
-        # Align evidence to cleaned levels by discarding root-node metadata.
-        root_count = max(0, len(values) - len(levels))
-        aligned_links = links[root_count:root_count + len(levels)]
-        aligned_ids = category_ids[root_count:root_count + len(levels)]
-        parent_pairs = list(zip(aligned_links[:-1], aligned_ids[:-1]))
-        all_pairs = list(zip(aligned_links, aligned_ids))
-        leaf_link = aligned_links[-1] if aligned_links else ""
+        parent_pairs = [(node.url, bool(node.category_id)) for node in nodes[:-1]]
+        all_pairs = [(node.url, bool(node.category_id)) for node in nodes]
+        leaf_link = nodes[-1].url
         parent_verified = all(
             _is_category_url(href, page_url) if href else has_id
             for href, has_id in parent_pairs) and (
@@ -581,16 +864,20 @@ def _visible_breadcrumb_paths(
         noncategory_link = any(
             bool(href) and not _is_category_url(href, page_url)
             for href, has_id in all_pairs)
-        key = tuple(normalize_category_name(value) for value in levels)
+        key = tuple(normalize_category_name(node.name) for node in nodes)
         if key in seen:
             continue
         seen.add(key)
         paths.append(_PathDescriptor(
-            tuple(levels), "visible_breadcrumb",
+            tuple(nodes), "visible_breadcrumb",
             parent_links_verified=parent_verified,
             all_nodes_verified=all_nodes_verified,
-            structured_breadcrumb="breadcrumblist" in str(
-                container.get("itemtype") or "").casefold(),
+            structured_breadcrumb=(
+                "breadcrumblist" in str(
+                    container.get("itemtype") or "").casefold() or
+                any("itemlistelement" in _itemprop_tokens(item)
+                    for item in items)
+            ),
             has_noncategory_parent_link=noncategory_parent,
             has_noncategory_link=noncategory_link,
             leaf_link=leaf_link,
@@ -634,7 +921,7 @@ def _breadcrumb_items_to_descriptor(
 ) -> _PathDescriptor | None:
     if not isinstance(items, list):
         return None
-    positioned: list[tuple[int, str, str]] = []
+    raw_nodes: list[CategoryBreadcrumbNode] = []
     for index, item in enumerate(items):
         if not isinstance(item, Mapping):
             continue
@@ -653,27 +940,37 @@ def _breadcrumb_items_to_descriptor(
             position = int(item.get("position") or index + 1)
         except (TypeError, ValueError):
             position = index + 1
-        positioned.append((position, str(name).strip(), url))
-    positioned.sort()
-    names = [name for _position, name, _url in positioned]
-    levels = clean_category_levels(names)
-    if not levels:
+        category_id = str(
+            item.get("category-id") or item.get("data-category-id") or
+            (nested.get("category-id") if isinstance(nested, Mapping) else "") or
+            (nested.get("data-category-id") if isinstance(nested, Mapping) else "") or
+            "")
+        raw_nodes.append(CategoryBreadcrumbNode(
+            name=str(name).strip(),
+            source="json_ld_breadcrumb",
+            url=url,
+            category_id=category_id,
+            position=position,
+        ))
+    nodes = _clean_breadcrumb_nodes(raw_nodes)
+    if not nodes:
         return None
-    root_count = max(0, len(names) - len(levels))
-    urls = [url for _position, _name, url in positioned][root_count:]
-    parents = urls[:-1]
-    leaf_link = urls[-1] if urls else ""
+    parents = [node.url for node in nodes[:-1]]
+    leaf_link = nodes[-1].url
     parent_verified = all(
-        _is_category_url(url, page_url) for url in parents) and (
-            bool(parents) or bool(leaf_link))
-    all_nodes_verified = bool(urls) and all(
-        _is_category_url(url, page_url) for url in urls)
+        (_is_category_url(node.url, page_url) if node.url else bool(node.category_id))
+        for node in nodes[:-1]) and (
+            bool(nodes[:-1]) or bool(leaf_link))
+    all_nodes_verified = bool(nodes) and all(
+        (_is_category_url(node.url, page_url) if node.url else bool(node.category_id))
+        for node in nodes)
     noncategory_parent = any(
         bool(url) and not _is_category_url(url, page_url) for url in parents)
     noncategory_link = any(
-        bool(url) and not _is_category_url(url, page_url) for url in urls)
+        bool(node.url) and not _is_category_url(node.url, page_url)
+        for node in nodes)
     return _PathDescriptor(
-        tuple(levels), "json_ld_breadcrumb",
+        tuple(nodes), "json_ld_breadcrumb",
         parent_links_verified=parent_verified,
         all_nodes_verified=all_nodes_verified,
         structured_breadcrumb=True,
